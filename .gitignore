@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.a
+*.elf
+*.map
+core_87000000
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

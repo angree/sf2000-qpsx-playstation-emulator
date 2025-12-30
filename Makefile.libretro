@@ -1,0 +1,173 @@
+# PCSX4ALL libretro Makefile for SF2000
+# Based on UAE4ALL libretro Makefile - follow EXACT same patterns!
+# QPSX_043 - REAL BIOS: Use scph5501.bin instead of HLE + debug logging
+
+NAME    = pcsx4all
+O       = o
+RM      = rm -f
+
+# GPU plugin selection
+GPU     = gpu_unai
+SPU     = spu_pcsxrearmed
+
+# Use MIPS recompiler
+RECOMPILER = mips
+
+# SF2000 platform - FLAGS FROM MULTICORE FRAMEWORK (beetle-psx + main Makefile)
+ifeq ($(platform), sf2000)
+    TARGET := $(NAME)_libretro_$(platform).a
+    MIPS=/tmp/mips32-mti-elf/2019.09-03-2/bin/mips-mti-elf-
+    CC = $(MIPS)gcc
+    CXX = $(MIPS)g++
+    AR = $(MIPS)ar
+    # FLAGS EXACTLY FROM MULTICORE (main Makefile + beetle-psx):
+    CFLAGS += -EL -march=mips32 -mtune=mips32 -msoft-float -ffast-math
+    CFLAGS += -G0 -mno-abicalls -fno-pic -ffreestanding
+    CFLAGS += -ffunction-sections -fdata-sections
+    CFLAGS += -fno-use-cxa-atexit
+    CFLAGS += -DSF2000 -DNO_THREADS
+    STATIC_LINKING = 1
+else
+    TARGET = $(NAME)_libretro.so
+    CC = gcc
+    CXX = g++
+endif
+
+all: $(TARGET)
+
+# Port selection - libretro (not SDL!)
+PORT = libretro
+
+# Common flags (based on UAE4ALL pattern)
+ifeq ($(platform), sf2000)
+MORE_CFLAGS = -Os -Isrc/ -Isrc/spu/$(SPU) -Isrc/gpu/$(GPU) \
+	-Isrc/plugin_lib \
+	-Isrc/port/$(PORT) \
+	-Ilibretro/core -Ilibretro/include \
+	-fomit-frame-pointer -fno-threadsafe-statics \
+	-Wno-unused -Wno-format -Wno-sign-compare \
+	-fno-exceptions -fno-rtti \
+	-DINLINE="static __inline__" \
+	-D$(shell echo $(GPU) | tr a-z A-Z) \
+	-D$(shell echo $(SPU) | tr a-z A-Z)
+else
+MORE_CFLAGS = -g -O2 -Isrc/ -Isrc/spu/$(SPU) -Isrc/gpu/$(GPU) \
+	-Isrc/plugin_lib \
+	-Isrc/port/$(PORT) \
+	-Ilibretro/core -Ilibretro/include \
+	-fomit-frame-pointer -fno-threadsafe-statics \
+	-Wno-unused -Wno-format -Wno-sign-compare \
+	-fno-exceptions -fno-rtti \
+	-DINLINE="static __inline__" \
+	-D$(shell echo $(GPU) | tr a-z A-Z) \
+	-D$(shell echo $(SPU) | tr a-z A-Z)
+endif
+
+# Libretro defines
+MORE_CFLAGS += -D__LIBRETRO__
+MORE_CFLAGS += -DHAVE_LIBRETRO
+
+# QPSX_035: Enable MIPS recompiler for SF2000
+# Cache flush now uses __builtin___clear_cache() -> _flush_cache() from multicore framework
+MORE_CFLAGS += -DPSXREC -D$(RECOMPILER)
+
+# Use gpulib
+MORE_CFLAGS += -DUSE_GPULIB
+MORE_CFLAGS += -Isrc/gpu/gpulib
+
+# HLE BIOS
+MORE_CFLAGS += -DHLE_BIOS
+
+# NO ZLIB on SF2000 (bare metal has no zlib)
+ifeq ($(platform), sf2000)
+MORE_CFLAGS += -DNO_ZLIB
+endif
+
+# XA audio hack
+MORE_CFLAGS += -DXA_HACK
+
+CFLAGS  += $(MORE_CFLAGS)
+CXXFLAGS = $(CFLAGS)
+
+# Object files - Core PSX emulation
+OBJS = \
+	src/r3000a.o \
+	src/misc.o \
+	src/plugins.o \
+	src/psxmem.o \
+	src/psxhw.o \
+	src/psxcounters.o \
+	src/psxdma.o \
+	src/psxbios.o \
+	src/psxhle.o \
+	src/psxevents.o \
+	src/psxcommon.o \
+	src/psxinterpreter.o \
+	src/mdec.o \
+	src/decode_xa.o \
+	src/cdriso.o \
+	src/cdrom.o \
+	src/ppf.o \
+	src/sio.o \
+	src/pad.o \
+	src/gte.o
+
+# MIPS Recompiler - QPSX_035: Enabled for SF2000 with custom cache flush
+OBJS += \
+	src/recompiler/mips/recompiler.o \
+	src/recompiler/mips/mips_codegen.o \
+	src/recompiler/mips/mips_disasm.o \
+	src/recompiler/mips/mem_mapping.o
+
+# GPU - using gpulib + unai
+OBJS += \
+	src/gpu/$(GPU)/gpulib_if.o \
+	src/gpu/gpulib/gpu.o \
+	src/gpu/gpulib/vout_port.o
+
+# SPU - pcsxrearmed with libretro audio backend
+OBJS += \
+	src/spu/$(SPU)/spu.o \
+	src/spu/$(SPU)/dma.o \
+	src/spu/$(SPU)/freeze.o \
+	src/spu/$(SPU)/out.o \
+	src/spu/$(SPU)/nullsnd.o \
+	src/spu/$(SPU)/registers.o \
+	src/spu/$(SPU)/libretro.o
+
+# Plugin lib
+OBJS += \
+	src/plugin_lib/plugin_lib.o \
+	src/plugin_lib/perfmon.o \
+	src/plugin_lib/pl_sshot.o
+
+# Libretro port
+OBJS += \
+	src/port/$(PORT)/port.o
+
+# Libretro core
+OBJS += \
+	libretro/core/libretro-core.o
+
+$(TARGET): $(OBJS)
+ifeq ($(STATIC_LINKING), 1)
+	$(AR) rcs $@ $(OBJS)
+else
+	$(CXX) -shared -o $(TARGET) $(OBJS) $(LDFLAGS)
+endif
+
+clean:
+	$(RM) $(TARGET) $(OBJS)
+
+# Compilation rules
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+%.o: %.S
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.s
+	$(CC) $(CFLAGS) -c $< -o $@
