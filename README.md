@@ -19,25 +19,64 @@ Based on PCSX4ALL with MIPS-to-MIPS dynamic recompiler, ported to the SF2000/GB3
 
 1. Copy `core_87000000` to SD card: `cores/psx/core_87000000`
 2. Copy PlayStation BIOS to: `bios/scph1001.bin` (US) or `scph5502.bin` (EU)
-3. Copy games (CUE/BIN format) to: `ROMS/psx/`
-4. Create ROM stubs: `psx;GameName.cue.gba` (empty files)
+3. Prepare games as described below
+4. Create ROM stubs in ROMS folder (see below)
 
 ### GB300
 
 Same as SF2000, but using the GB300 binary.
 
-### Multi-BIN Games (CD Audio tracks)
+## Preparing Games (CUE/BIN)
 
-For games with multiple BIN files (like Tekken with 28 tracks):
+Games must be in CUE/BIN format. The emulator uses a **subfolder system** to keep the game list clean.
+
+### Folder Structure
 
 ```
-ROMS/psx/
-├── GameName.cue                    <- CUE in root (shows in game list)
-└── GameName/                       <- Subfolder with same name
-    ├── GameName (Track 01).bin     <- Data track
-    ├── GameName (Track 02).bin     <- Audio tracks
-    └── ...
+SD Card/
+├── ROMS/
+│   └── psx/
+│       ├── psx;Crash Bandicoot.cue.gba    <- Empty stub file (0 bytes)
+│       ├── psx;Tekken 3.cue.gba           <- Empty stub file (0 bytes)
+│       │
+│       ├── Crash Bandicoot/               <- Subfolder = game name
+│       │   ├── Crash Bandicoot.cue        <- CUE file
+│       │   └── Crash Bandicoot.bin        <- BIN file(s)
+│       │
+│       └── Tekken 3/                      <- Subfolder = game name
+│           ├── Tekken 3.cue               <- CUE file
+│           ├── Tekken 3 (Track 01).bin    <- Data track
+│           ├── Tekken 3 (Track 02).bin    <- Audio track
+│           └── ...                        <- More audio tracks
+│
+├── bios/
+│   └── scph1001.bin                       <- PlayStation BIOS
+│
+└── cores/
+    └── psx/
+        └── core_87000000                  <- Emulator binary
 ```
+
+### Step-by-Step
+
+1. **Create subfolder** with exact game name in `ROMS/psx/`
+2. **Put CUE and BIN files** inside that subfolder
+3. **Create empty stub file** in `ROMS/psx/` with format: `psx;GameName.cue.gba`
+   - The stub must be 0 bytes (empty file)
+   - GameName must match subfolder name exactly
+   - Example: `psx;Crash Bandicoot.cue.gba` for folder `Crash Bandicoot/`
+
+### Creating Stub Files (Windows)
+
+Open CMD in `ROMS/psx/` folder and run:
+```
+type nul > "psx;Crash Bandicoot.cue.gba"
+type nul > "psx;Tekken 3.cue.gba"
+```
+
+### Multi-Track Games (CD Audio)
+
+Many PSX games have multiple BIN files for CD audio tracks. Put ALL BIN files in the subfolder - the CUE file references them by name.
 
 ## Controls
 
