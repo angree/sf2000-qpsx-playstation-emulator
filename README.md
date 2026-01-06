@@ -98,9 +98,9 @@ Many PSX games have multiple BIN files for CD audio tracks. Put ALL BIN files in
 
 Hold START for 1 second to open the configuration menu:
 
-- **Frameskip**: 0-5 (0 = no skip, higher = more skip)
+- **Frameskip**: 0-5 (0 = no skip, higher = more skip; recommended 0-1 for 3D games, 0-2 for 2D games)
 - **BIOS**: HLE (fast) or Real BIOS (more compatible)
-- **CPU Cycle**: 256-2048 (higher = more accurate but slower)
+- **CPU Cycle**: 256-2048 (higher = more accurate but slower; too high value is going to crash some games)
 - **Show FPS**: Display framerate counter
 - And more options...
 
