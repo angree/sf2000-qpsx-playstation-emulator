@@ -33,6 +33,7 @@
 #include "psxhw.h"
 #include "r3000a.h"
 #include "gte.h"
+#include "profiler.h"   /* v092: Profiler support */
 
 /* For direct HW I/O */
 #include "mdec.h"
@@ -57,6 +58,376 @@
 // #define ASM_EXECUTE_LOOP
 
 extern "C" void xlog(const char *fmt, ...);
+
+/* v192: Counters from rec_native.cpp.h for stats */
+extern u32 native_used;
+extern u32 dynarec_used;
+
+/* ============== v194: DIFFERENTIAL TESTING (FIXED) ==============
+ * Run BOTH dynarec and native for each block, compare results.
+ * Dynarec is used for actual execution (game works).
+ * Native runs in parallel for comparison (detects bugs).
+ *
+ * v194 FIXES:
+ * - MUCH smaller buffers (was 6MB, now 256KB total)
+ * - Only log on MISMATCH (not every comparison)
+ * - Log instruction types when mismatch found
+ */
+#define DIFF_TEST_ENABLE 1   /* v225: ON - rozszerzony diff test (rejestry + pamięć) */
+#define DIFF_TEST_LOG_LIMIT 20  /* Max mismatches to log */
+
+#if DIFF_TEST_ENABLE
+/* v194: SMALLER buffers - SF2000 has limited RAM! */
+#define NATIVE_CODE_BUF_SIZE (128*1024)  /* 128KB for native code */
+#define NATIVE_LUT_SIZE      (16*1024)   /* 16K entries = 64KB for LUT */
+
+static u8 native_code_buffer[NATIVE_CODE_BUF_SIZE] __attribute__((aligned(16)));
+static u32 native_code_guard[16] __attribute__((aligned(4)));  /* v238: Guard after buffer */
+static u8* native_code_ptr = native_code_buffer;
+static u8* native_code_end = native_code_buffer + NATIVE_CODE_BUF_SIZE;
+
+/* v238: Overflow detection for native_code_buffer */
+static void init_native_code_guard(void) {
+    for (int i = 0; i < 16; i++) {
+        native_code_guard[i] = 0xCAFEBABE;
+    }
+}
+
+static bool check_native_code_overflow(void) {
+    for (int i = 0; i < 16; i++) {
+        if (native_code_guard[i] != 0xCAFEBABE) {
+            xlog("!!! OVERFLOW in native_code_buffer! guard[%d]=0x%08X\n", i, native_code_guard[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Simple hash LUT - wraps around if collision */
+static void* native_block_lut[NATIVE_LUT_SIZE] __attribute__((aligned(4)));
+static u32   native_block_pc[NATIVE_LUT_SIZE] __attribute__((aligned(4)));  /* Store PC for verification */
+
+/* Stats for differential testing */
+static u32 diff_test_count __attribute__((aligned(4))) = 0;
+static u32 diff_mismatch_count __attribute__((aligned(4))) = 0;
+static u32 diff_native_compiled __attribute__((aligned(4))) = 0;
+
+/* Convert PC to LUT index (simple hash) */
+static inline u32 pc_to_lut_idx(u32 pc) {
+    return ((pc >> 2) ^ (pc >> 14)) & (NATIVE_LUT_SIZE - 1);
+}
+
+/* Register names for logging */
+static const char* gpr_names[32] = {
+    "r0", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+    "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"
+};
+
+/* v194: Log block instructions on mismatch */
+static void diff_log_block_instrs(u32 pc) {
+    xlog("  Block instrs at %08X:\n", pc);
+    for (int i = 0; i < 8; i++) {  /* Log up to 8 instructions */
+        u32 addr = pc + i * 4;
+        if (addr < 0x00200000 || (addr >= 0x80000000 && addr < 0x80200000)) {
+            u32 op = *(u32*)PSXM(addr);
+            u32 opcode = op >> 26;
+            const char* name = "???";
+            if (op == 0) name = "NOP";
+            else if (opcode == 0x00) name = "ALU-R";
+            else if (opcode >= 0x08 && opcode <= 0x0E) name = "ALU-I";
+            else if (opcode == 0x0F) name = "LUI";
+            else if (opcode >= 0x20 && opcode <= 0x26) name = "LOAD";
+            else if (opcode >= 0x28 && opcode <= 0x2E) name = "STORE";
+            else if (opcode == 0x04) name = "BEQ";
+            else if (opcode == 0x05) name = "BNE";
+            else if (opcode == 0x06) name = "BLEZ";
+            else if (opcode == 0x07) name = "BGTZ";
+            else if (opcode == 0x02) name = "J";
+            else if (opcode == 0x03) name = "JAL";
+            xlog("    [%d] %08X: %s\n", i, op, name);
+        }
+    }
+}
+
+/* v225: ROZSZERZONY DIFF TEST
+ * Porównuje: GPR, PC, lo, hi, cycle + memory checksum
+ *
+ * v210: SKIP $at (register 1) - dynarec uses it as scratch
+ */
+
+/* v225: Memory checksum counter */
+static u32 diff_mem_mismatch_count __attribute__((aligned(4))) = 0;
+
+/* v225: Simple XOR checksum for memory region */
+static u32 mem_checksum(u8* mem, u32 size) {
+    u32 sum = 0;
+    u32* p = (u32*)mem;
+    u32 words = size / 4;
+    for (u32 i = 0; i < words; i++) {
+        sum ^= p[i];
+    }
+    return sum;
+}
+
+/* v225: Extended comparison - GPR + lo + hi + cycle
+ * Memory comparison done separately in main loop
+ */
+static bool diff_test_compare(u32 pc, psxRegisters* before, psxRegisters* dynarec, psxRegisters* native) {
+    bool mismatch = false;
+    bool gpr_mismatch = false;
+    bool lohi_mismatch = false;
+    bool pc_mismatch = false;
+
+    /* Check GPR - SKIP $at (reg 1), it's scratch! */
+    for (int i = 2; i < 32; i++) {
+        if (dynarec->GPR.r[i] != native->GPR.r[i]) {
+            gpr_mismatch = true;
+            mismatch = true;
+            break;
+        }
+    }
+
+    /* Check PC */
+    if (dynarec->pc != native->pc) {
+        pc_mismatch = true;
+        mismatch = true;
+    }
+
+    /* v225: Check lo/hi (MULT/DIV results) */
+    if (dynarec->GPR.n.lo != native->GPR.n.lo ||
+        dynarec->GPR.n.hi != native->GPR.n.hi) {
+        lohi_mismatch = true;
+        mismatch = true;
+    }
+
+    if (!mismatch) {
+        diff_test_count++;
+        return false;  /* Match - native produced same result as dynarec */
+    }
+
+    /* MISMATCH FOUND - log FULL state for first 10 mismatches */
+    if (diff_mismatch_count >= 10) {
+        diff_mismatch_count++;
+        diff_test_count++;
+        return true;
+    }
+
+    xlog("\n=== MISMATCH #%d at PC=%08X ===\n", diff_mismatch_count + 1, pc);
+    if (gpr_mismatch) xlog("  TYPE: GPR\n");
+    if (pc_mismatch) xlog("  TYPE: PC\n");
+    if (lohi_mismatch) xlog("  TYPE: LO/HI\n");
+
+    diff_log_block_instrs(pc);
+
+    /* Log BEFORE state */
+    xlog("  --- BEFORE ---\n");
+    xlog("  v0=%08X v1=%08X a0=%08X a1=%08X\n",
+         before->GPR.r[2], before->GPR.r[3], before->GPR.r[4], before->GPR.r[5]);
+    xlog("  lo=%08X hi=%08X\n", before->GPR.n.lo, before->GPR.n.hi);
+
+    /* Log DYNAREC result */
+    xlog("  --- DYNAREC ---\n");
+    xlog("  v0=%08X v1=%08X a0=%08X a1=%08X\n",
+         dynarec->GPR.r[2], dynarec->GPR.r[3], dynarec->GPR.r[4], dynarec->GPR.r[5]);
+    xlog("  lo=%08X hi=%08X pc=%08X\n", dynarec->GPR.n.lo, dynarec->GPR.n.hi, dynarec->pc);
+
+    /* Log NATIVE result */
+    xlog("  --- NATIVE ---\n");
+    xlog("  v0=%08X v1=%08X a0=%08X a1=%08X\n",
+         native->GPR.r[2], native->GPR.r[3], native->GPR.r[4], native->GPR.r[5]);
+    xlog("  lo=%08X hi=%08X pc=%08X\n", native->GPR.n.lo, native->GPR.n.hi, native->pc);
+
+    /* Log which registers DIFFER */
+    xlog("  --- DIFFS ---\n");
+    for (int i = 1; i < 32; i++) {
+        if (dynarec->GPR.r[i] != native->GPR.r[i]) {
+            xlog("  $%s: dyn=%08X nat=%08X\n",
+                 gpr_names[i], dynarec->GPR.r[i], native->GPR.r[i]);
+        }
+    }
+    if (lohi_mismatch) {
+        xlog("  LO: dyn=%08X nat=%08X\n", dynarec->GPR.n.lo, native->GPR.n.lo);
+        xlog("  HI: dyn=%08X nat=%08X\n", dynarec->GPR.n.hi, native->GPR.n.hi);
+    }
+    if (pc_mismatch) {
+        xlog("  PC: dyn=%08X nat=%08X\n", dynarec->pc, native->pc);
+    }
+
+    diff_mismatch_count++;
+    diff_test_count++;
+
+    if (diff_mismatch_count >= 10) {
+        xlog("=== GPR log limit reached ===\n");
+    }
+    return true;  /* Mismatch */
+}
+#endif /* DIFF_TEST_ENABLE */
+
+/* ============== v237: NATIVE DEBUG RING BUFFER ==============
+ * Captures last N native block executions for crash debugging.
+ * When native mode freezes, we can see what blocks ran before crash.
+ */
+#define NATIVE_DEBUG_RING 1          /* v238: RE-ENABLED with overflow guards */
+#define NATIVE_DEBUG_RING_SIZE 50    /* Last 50 blocks */
+
+#if NATIVE_DEBUG_RING
+struct NativeDebugEntry {
+    u32 pc_before;      /* PC before execution */
+    u32 pc_after;       /* PC after execution */
+    u32 cycle_before;   /* Cycle count before */
+    u32 cycle_after;    /* Cycle count after */
+    u32 v0_before;      /* $v0 before */
+    u32 v0_after;       /* $v0 after */
+    u32 v1_before;      /* $v1 before */
+    u32 v1_after;       /* $v1 after */
+    u32 sp_before;      /* $sp before */
+    u32 ra_before;      /* $ra before */
+    u32 block_ptr;      /* Pointer to block code */
+    u32 is_native;      /* 1=native, 0=dynarec */
+};
+
+static NativeDebugEntry native_debug_ring[NATIVE_DEBUG_RING_SIZE] __attribute__((aligned(4)));
+static u32 native_debug_ring_idx __attribute__((aligned(4))) = 0;
+static u32 native_debug_ring_count __attribute__((aligned(4))) = 0;
+static bool native_debug_dumped __attribute__((aligned(4))) = false;
+
+static void native_debug_ring_add(u32 pc_before, u32 block_ptr, bool is_native) {
+    NativeDebugEntry* e = &native_debug_ring[native_debug_ring_idx];
+    e->pc_before = pc_before;
+    e->cycle_before = psxRegs.cycle;
+    e->v0_before = psxRegs.GPR.n.v0;
+    e->v1_before = psxRegs.GPR.n.v1;
+    e->sp_before = psxRegs.GPR.n.sp;
+    e->ra_before = psxRegs.GPR.n.ra;
+    e->block_ptr = block_ptr;
+    e->is_native = is_native ? 1 : 0;
+    /* After fields filled by native_debug_ring_complete() */
+}
+
+static void native_debug_ring_complete(void) {
+    NativeDebugEntry* e = &native_debug_ring[native_debug_ring_idx];
+    e->pc_after = psxRegs.pc;
+    e->cycle_after = psxRegs.cycle;
+    e->v0_after = psxRegs.GPR.n.v0;
+    e->v1_after = psxRegs.GPR.n.v1;
+    /* Advance ring */
+    native_debug_ring_idx = (native_debug_ring_idx + 1) % NATIVE_DEBUG_RING_SIZE;
+    if (native_debug_ring_count < NATIVE_DEBUG_RING_SIZE)
+        native_debug_ring_count++;
+}
+
+static void native_debug_ring_dump(void) {
+    if (native_debug_dumped) return;
+    native_debug_dumped = true;
+
+    xlog("\n=== NATIVE DEBUG RING DUMP (last %d blocks) ===\n", native_debug_ring_count);
+
+    /* Start from oldest entry */
+    u32 start_idx = (native_debug_ring_count < NATIVE_DEBUG_RING_SIZE)
+                  ? 0
+                  : native_debug_ring_idx;
+
+    for (u32 i = 0; i < native_debug_ring_count; i++) {
+        u32 idx = (start_idx + i) % NATIVE_DEBUG_RING_SIZE;
+        NativeDebugEntry* e = &native_debug_ring[idx];
+
+        xlog("[%02d] %s PC:%08X->%08X cyc:%d->%d (+%d)\n",
+             i, e->is_native ? "NAT" : "DYN",
+             e->pc_before, e->pc_after,
+             e->cycle_before, e->cycle_after,
+             e->cycle_after - e->cycle_before);
+        xlog("     v0:%08X->%08X v1:%08X->%08X sp:%08X ra:%08X ptr:%08X\n",
+             e->v0_before, e->v0_after,
+             e->v1_before, e->v1_after,
+             e->sp_before, e->ra_before, e->block_ptr);
+    }
+    xlog("=== END RING DUMP ===\n");
+}
+#endif /* NATIVE_DEBUG_RING */
+
+/* v217: These counters are needed in ALL modes (not just DIFF_TEST) */
+/* v200: Track native execution vs dynarec fallback (extern for display) */
+u32 native_exec_count __attribute__((aligned(4))) = 0;
+u32 dynarec_fallback_count __attribute__((aligned(4))) = 0;
+
+/* v205: COMPLETE rejection tracking - EVERY instruction type! */
+u32 nat_blocks_attempted __attribute__((aligned(4))) = 0;
+/* Pre-loop rejections: */
+u32 nat_rej_remap __attribute__((aligned(4))) = 0;    /* $sp/$fp/$ra */
+u32 nat_rej_k0k1 __attribute__((aligned(4))) = 0;     /* $k0/$k1 */
+u32 nat_rej_garbage __attribute__((aligned(4))) = 0;  /* garbage block */
+/* Jump/branch: */
+u32 nat_rej_j __attribute__((aligned(4))) = 0;        /* J */
+u32 nat_rej_jal __attribute__((aligned(4))) = 0;      /* JAL */
+u32 nat_rej_jr __attribute__((aligned(4))) = 0;       /* JR */
+u32 nat_rej_jalr __attribute__((aligned(4))) = 0;     /* JALR */
+u32 nat_rej_bxx __attribute__((aligned(4))) = 0;      /* branches */
+u32 nat_rej_regimm __attribute__((aligned(4))) = 0;   /* BLTZ/BGEZ */
+u32 nat_rej_delay __attribute__((aligned(4))) = 0;    /* non-NOP delay */
+/* Coprocessor: */
+u32 nat_rej_cop0 __attribute__((aligned(4))) = 0;     /* MFC0/MTC0/RFE */
+u32 nat_rej_gte __attribute__((aligned(4))) = 0;      /* COP2/GTE ops */
+u32 nat_rej_lwc2 __attribute__((aligned(4))) = 0;     /* LWC2 */
+u32 nat_rej_swc2 __attribute__((aligned(4))) = 0;     /* SWC2 */
+/* Unaligned load/store: */
+u32 nat_rej_lwl __attribute__((aligned(4))) = 0;      /* LWL */
+u32 nat_rej_lwr __attribute__((aligned(4))) = 0;      /* LWR */
+u32 nat_rej_swl __attribute__((aligned(4))) = 0;      /* SWL */
+u32 nat_rej_swr __attribute__((aligned(4))) = 0;      /* SWR */
+/* Other: */
+u32 nat_rej_syscall __attribute__((aligned(4))) = 0;  /* SYSCALL */
+u32 nat_rej_break __attribute__((aligned(4))) = 0;    /* BREAK */
+u32 nat_rej_other __attribute__((aligned(4))) = 0;    /* unknown */
+
+/* v218: Buffer for native compilation attempts in production mode
+ * Dynarec compiles to main buffer first, then we try native to this temp buffer.
+ * If native succeeds, we copy it to main buffer (overwrites dynarec).
+ * If native fails, dynarec code remains in main buffer untouched.
+ */
+#define NATIVE_TRY_BUF_SIZE (32*1024)  /* v242: 32KB for single block (was 16KB - too small!) */
+static u8 native_try_buffer[NATIVE_TRY_BUF_SIZE] __attribute__((aligned(16)));
+
+/* v238: OVERFLOW DETECTION - guard patterns after buffers */
+#define GUARD_PATTERN 0xDEADBEEF
+#define GUARD_SIZE 64  /* 64 bytes = 16 words */
+static u32 native_try_guard[GUARD_SIZE/4] __attribute__((aligned(4)));
+
+static void init_overflow_guards(void) {
+    for (int i = 0; i < GUARD_SIZE/4; i++) {
+        native_try_guard[i] = GUARD_PATTERN;
+    }
+}
+
+static bool check_native_try_overflow(void) {
+    for (int i = 0; i < GUARD_SIZE/4; i++) {
+        if (native_try_guard[i] != GUARD_PATTERN) {
+            xlog("!!! OVERFLOW DETECTED in native_try_buffer! guard[%d]=0x%08X\n",
+                 i, native_try_guard[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* v139: g_native_cycles global is no longer needed!
+ * Native blocks now set $v1 = cycle count AFTER emit_save_gprs(),
+ * so recFunc's normal dispatcher adds $v1 to psxRegs.cycle.
+ * This is the same mechanism dynarec blocks use.
+ */
+
+/* v130: EXECUTION DEBUGGING - smarter logging */
+/* Only log when PC CHANGES (new block), not every iteration of loops */
+/* v192: DISABLED - was killing performance by forcing C dispatch */
+#define NATIVE_EXEC_DEBUG 0
+#if NATIVE_EXEC_DEBUG
+/* v151: Aligned for SF2000 stability */
+static u32 native_exec_log_count __attribute__((aligned(4))) = 0;
+static u32 native_last_pc __attribute__((aligned(4))) = 0;
+static u32 native_loop_count __attribute__((aligned(4))) = 0;
+#define NATIVE_EXEC_LOG_LIMIT 100        /* Log first N unique PC transitions */
+#endif
 
 /* Scan for and skip useless code in PS1 executable: */
 #define USE_CODE_DISCARD
@@ -233,6 +604,213 @@ static bool emit_code_invalidations;       /* Emit code invalidation for store i
 
 /* v063: External SMC check disable flag (from libretro config) */
 extern int qpsx_nosmccheck;
+/* v112: Cycle batching level (0=OFF, 1=2x, 2=4x, 3=8x) */
+extern int g_opt_cycle_batch;
+/* v113: Hot Block Cache level (0=OFF, 1-7 = 256 to 1M entries) */
+extern int g_opt_block_cache;
+/* v114: Native Mode (0=OFF, 1=STATS, 2=FAST) */
+extern int g_opt_native_mode;
+
+/***************************************************************************
+ * v113: Hot Block Cache - Fast dispatch cache for frequently executed blocks
+ *
+ * Structure: Direct-mapped cache indexed by hash of PC
+ * Entry: 8 bytes (4 byte PC + 4 byte code pointer)
+ * Hash: (PC >> 2) & mask
+ *
+ * Size levels (entries): 0=OFF, 1=256, 2=1K, 3=4K, 4=16K, 5=64K, 6=256K, 7=1M
+ * Memory usage: entries * 8 bytes = 2KB to 8MB
+ ***************************************************************************/
+typedef struct {
+    u32 pc;         /* PSX PC address */
+    void *code;     /* Pointer to compiled code */
+} HotBlockEntry;
+
+/* v151: Aligned for SF2000 stability */
+static HotBlockEntry *hot_block_cache __attribute__((aligned(4))) = NULL;
+static u32 hot_block_mask __attribute__((aligned(4))) = 0;          /* (entries - 1) for hash masking */
+static int hot_block_level __attribute__((aligned(4))) = 0;         /* Current cache level */
+
+/* Size table: level -> entry count (must be power of 2) */
+static const u32 hbc_sizes[8] = {
+    0,          /* 0: OFF */
+    256,        /* 1: 256 entries = 2KB */
+    1024,       /* 2: 1K entries = 8KB */
+    4096,       /* 3: 4K entries = 32KB */
+    16384,      /* 4: 16K entries = 128KB */
+    65536,      /* 5: 64K entries = 512KB */
+    262144,     /* 6: 256K entries = 2MB */
+    1048576     /* 7: 1M entries = 8MB */
+};
+
+/* Initialize/resize Hot Block Cache based on g_opt_block_cache */
+static void hbc_init(void)
+{
+    int level = g_opt_block_cache;
+    if (level < 0 || level > 7) level = 0;
+
+    /* No change needed? */
+    if (level == hot_block_level && hot_block_cache != NULL)
+        return;
+
+    /* Free old cache */
+    if (hot_block_cache != NULL) {
+        free(hot_block_cache);
+        hot_block_cache = NULL;
+        hot_block_mask = 0;
+    }
+
+    hot_block_level = level;
+
+    /* OFF? */
+    if (level == 0)
+        return;
+
+    /* Allocate new cache */
+    u32 entries = hbc_sizes[level];
+    hot_block_cache = (HotBlockEntry*)calloc(entries, sizeof(HotBlockEntry));
+    if (hot_block_cache == NULL) {
+        REC_LOG("HBC: Failed to allocate %u entries!\n", entries);
+        hot_block_level = 0;
+        return;
+    }
+
+    hot_block_mask = entries - 1;
+    REC_LOG("HBC: Allocated %u entries (%u KB)\n", entries, (entries * 8) / 1024);
+}
+
+/* Clear Hot Block Cache (call on code cache flush) */
+static void hbc_clear(void)
+{
+    if (hot_block_cache != NULL && hot_block_mask > 0) {
+        memset(hot_block_cache, 0, (hot_block_mask + 1) * sizeof(HotBlockEntry));
+    }
+}
+
+/* Inline lookup - returns code ptr or NULL if miss */
+static inline void* hbc_lookup(u32 pc)
+{
+    if (hot_block_cache == NULL) return NULL;
+    u32 idx = (pc >> 2) & hot_block_mask;
+    if (hot_block_cache[idx].pc == pc)
+        return hot_block_cache[idx].code;
+    return NULL;
+}
+
+/* Inline store - update cache entry */
+static inline void hbc_store(u32 pc, void *code)
+{
+    if (hot_block_cache == NULL) return;
+    u32 idx = (pc >> 2) & hot_block_mask;
+    hot_block_cache[idx].pc = pc;
+    hot_block_cache[idx].code = code;
+}
+
+/***************************************************************************
+ * v114: Native Mode - MIPS I to MIPS32 direct execution statistics
+ *
+ * PSX (R3000A) uses MIPS I instruction set which is 100% binary compatible
+ * with SF2000's MIPS32. The dynarec ALREADY emits identical instructions!
+ * The overhead is in register management, not instruction encoding.
+ *
+ * Native-capable instructions (run identically on both CPUs):
+ *   - ALU R-type: ADD, ADDU, SUB, SUBU, AND, OR, XOR, NOR, SLT, SLTU
+ *   - Shifts: SLL, SRL, SRA, SLLV, SRLV, SRAV
+ *   - Immediate: ADDIU, ADDI, ANDI, ORI, XORI, SLTI, SLTIU, LUI
+ *   - Multiply/Divide: MULT, MULTU, DIV, DIVU, MFHI, MFLO, MTHI, MTLO
+ *   - Branches: BEQ, BNE, BGTZ, BLEZ, BLTZ, BGEZ, BLTZAL, BGEZAL
+ *   - Jumps: J, JAL, JR, JALR
+ *
+ * Non-native instructions (need emulation/translation):
+ *   - Load/Store: LB, LBU, LH, LHU, LW, LWL, LWR, SB, SH, SW, SWL, SWR
+ *     (PSX addresses ≠ host addresses, no MMU for translation)
+ *   - Coprocessors: COP0 (system), COP2 (GTE) - not available on host
+ *   - SYSCALL, BREAK - trigger exceptions
+ *
+ * STATS mode: Counts native vs emulated instructions (for analysis)
+ * FAST mode: Skips const propagation overhead for simple ALU operations
+ * SEMI mode: v115 - POPS-inspired semi-native execution (skips ALL const prop)
+ ***************************************************************************/
+
+/* Native mode statistics (visible to profiler) */
+typedef struct {
+    u32 native_alu;         /* ALU R-type (ADD, SUB, AND, OR, etc.) */
+    u32 native_shift;       /* Shifts (SLL, SRL, SRA) */
+    u32 native_imm;         /* Immediate ops (ADDIU, ANDI, ORI, etc.) */
+    u32 native_muldiv;      /* Multiply/Divide */
+    u32 native_branch;      /* Branches (BEQ, BNE, etc.) */
+    u32 native_jump;        /* Jumps (J, JAL, JR) */
+    u32 emulated_load;      /* Load instructions (need addr translation) */
+    u32 emulated_store;     /* Store instructions (need addr translation) */
+    u32 emulated_cop0;      /* COP0 instructions */
+    u32 emulated_cop2;      /* COP2/GTE instructions */
+    u32 emulated_syscall;   /* SYSCALL/BREAK */
+    u32 emulated_other;     /* Other non-native */
+    /* v115: Block classification stats (for SEMI mode analysis) */
+    u32 blocks_total;       /* Total blocks compiled */
+    u32 blocks_pure_alu;    /* "Pure" blocks (no load/store/COP) - could run semi-natively */
+    /* v118: Native execution stats */
+    u32 blocks_native;      /* Blocks actually compiled with native translator */
+} NativeModeStats;
+
+/* v151: Aligned for SF2000 stability */
+static NativeModeStats native_stats __attribute__((aligned(4)));
+static NativeModeStats native_stats_prev __attribute__((aligned(4))); /* For delta calculation */
+
+/* Get pointer to stats (for profiler display) */
+extern "C" const NativeModeStats* native_mode_get_stats(void)
+{
+    return &native_stats;
+}
+
+/* v117: Stats are now CUMULATIVE - show totals since game start, not per-frame.
+ * This is because compilation only happens once per code block. After initial
+ * compilation, blocks run from cache and no new stats are generated.
+ * Cumulative stats show the actual composition of compiled code.
+ */
+extern "C" void native_stats_reset_frame(void)
+{
+    /* v117: No longer reset stats - they're cumulative now */
+    (void)native_stats_prev; /* Unused but kept for potential future use */
+}
+
+/* Get native instruction ratio (0-100%) - CUMULATIVE since game start */
+extern "C" int native_mode_get_ratio(void)
+{
+    /* v117: Use native_stats directly (cumulative), not native_stats_prev */
+    u32 native = native_stats.native_alu + native_stats.native_shift +
+                 native_stats.native_imm + native_stats.native_muldiv +
+                 native_stats.native_branch + native_stats.native_jump;
+    u32 emulated = native_stats.emulated_load + native_stats.emulated_store +
+                   native_stats.emulated_cop0 + native_stats.emulated_cop2 +
+                   native_stats.emulated_syscall + native_stats.emulated_other;
+    u32 total = native + emulated;
+    if (total == 0) return 0;
+    return (native * 100) / total;
+}
+
+/* v115: Get pure block ratio (0-100%) - blocks that could run semi-natively */
+extern "C" int native_mode_get_pure_block_ratio(void)
+{
+    /* v117: Use native_stats directly (cumulative) */
+    if (native_stats.blocks_total == 0) return 0;
+    return (native_stats.blocks_pure_alu * 100) / native_stats.blocks_total;
+}
+
+/* Inline stat tracking macros (only active in STATS mode) */
+#define NATIVE_STAT_ALU()       do { if (g_opt_native_mode == 1) native_stats.native_alu++; } while(0)
+#define NATIVE_STAT_SHIFT()     do { if (g_opt_native_mode == 1) native_stats.native_shift++; } while(0)
+#define NATIVE_STAT_IMM()       do { if (g_opt_native_mode == 1) native_stats.native_imm++; } while(0)
+#define NATIVE_STAT_MULDIV()    do { if (g_opt_native_mode == 1) native_stats.native_muldiv++; } while(0)
+#define NATIVE_STAT_BRANCH()    do { if (g_opt_native_mode == 1) native_stats.native_branch++; } while(0)
+#define NATIVE_STAT_JUMP()      do { if (g_opt_native_mode == 1) native_stats.native_jump++; } while(0)
+#define NATIVE_STAT_LOAD()      do { if (g_opt_native_mode == 1) native_stats.emulated_load++; } while(0)
+#define NATIVE_STAT_STORE()     do { if (g_opt_native_mode == 1) native_stats.emulated_store++; } while(0)
+#define NATIVE_STAT_COP0()      do { if (g_opt_native_mode == 1) native_stats.emulated_cop0++; } while(0)
+#define NATIVE_STAT_COP2()      do { if (g_opt_native_mode == 1) native_stats.emulated_cop2++; } while(0)
+#define NATIVE_STAT_SYSCALL()   do { if (g_opt_native_mode == 1) native_stats.emulated_syscall++; } while(0)
+#define NATIVE_STAT_OTHER()     do { if (g_opt_native_mode == 1) native_stats.emulated_other++; } while(0)
+
 static bool flush_code_on_dma3_exe_load;   /* Flush code cache when psxDma3() detects EXE load? */
 
 /* Flags/vals used to cache common values in temp regs in emitted code */
@@ -250,7 +828,8 @@ char	disasm_buffer[512];
 
 static void recReset();
 static void recRecompile();
-static void recClear(u32 Addr, u32 Size);
+/* v101: recClear needs C linkage for psxmem_asm.S */
+extern "C" void recClear(u32 Addr, u32 Size);
 static void recNotify(int note, void *data);
 
 extern void (*recBSC[64])();
@@ -401,6 +980,11 @@ static inline void clear_insn_cache(void *start, void *end, int flags)
 	// (Index_Writeback_Inv_D + Index_Invalidate_I) since SF2000's MIPS32
 	// doesn't have the synci instruction from MIPS32r2.
 	__builtin___clear_cache((char *)start, (char *)end);
+	/* v149: HEISENBUG FIX - add full memory barrier after cache flush
+	 * Ensures all cache operations complete before CPU fetches new code.
+	 * This fixes the timing-dependent crash found in v148.
+	 */
+	__sync_synchronize();
 #else
 	// Use Linux system call (ends up flushing entire cache)
 	#ifdef DYNAREC_SKIP_DCACHE_FLUSH
@@ -451,6 +1035,8 @@ static void rec_set_options()
 
 static void recRecompile()
 {
+	PROFILE_START(PROF_CPU_COMPILE);
+
 	// Notify plugin_lib that we're recompiling (affects frameskip timing)
 	pl_dynarec_notify();
 
@@ -502,6 +1088,38 @@ static void recRecompile()
 	// Number of discardable instructions we are currently skipping
 	int discard_cnt = 0;
 
+	/* v115: Block classification for SEMI mode
+	 * Track if this block is "pure" (only native-capable instructions)
+	 * Pure blocks could potentially run semi-natively like POPS
+	 */
+	bool block_is_pure = true;  /* Assume pure until we hit a non-native instruction */
+
+	/* v118: Native block compilation (SEMI mode level 3)
+	 * Try to compile the block natively - bypasses normal dynarec entirely.
+	 * Native translator does its own analysis and handles:
+	 * - ALU/shift/branch/jump: byte-for-byte copy
+	 * - Load/store: address translation + original op
+	 * - Returns false if block uses forbidden registers or COP instructions
+	 */
+	bool native_compiled = false;
+
+	/* v155: BLOCK DIAGNOSTIC LOGGING - log first 20 blocks */
+	static int block_log_count = 0;
+
+	/* v218: Save start PC for native compilation (needed in ALL modes now) */
+	u32 block_start_pc = pc;
+	u32* recMemBlockStart = recMem;  /* Save recMem position before dynarec */
+
+#if DIFF_TEST_ENABLE
+	/* v195: DIFF_TEST - save start PC for later native compilation */
+	u32 diff_test_start_pc = pc;
+#endif
+
+	/* v218: REMOVED - don't try native first with required_count=0!
+	 * Native needs dynarec's instruction count to work correctly.
+	 * Dynarec will run first, then we try native with exact count.
+	 */
+
 	do {
 		// Flag indicates if next instruction lies in a BD slot
 		branch = false;
@@ -533,12 +1151,269 @@ static void recRecompile()
 #endif
 
 		// Recompile next instruction.
+
+		/* v117: Native Mode - track instruction categories & block purity
+		 * FIXED: Now tracks stats in ALL native modes, not just STATS mode!
+		 * Stats are cumulative (not reset per frame) to show meaningful numbers.
+		 */
+		if (g_opt_native_mode >= 1) {
+			u32 op = psxRegs.code >> 26;
+			u32 funct = psxRegs.code & 0x3f;
+			bool is_native = false;  /* Does this instruction affect block purity? */
+
+			switch (op) {
+				case 0x00: /* SPECIAL */
+					switch (funct) {
+						/* Native ALU R-type */
+						case 0x20: case 0x21: /* ADD, ADDU */
+						case 0x22: case 0x23: /* SUB, SUBU */
+						case 0x24: case 0x25: /* AND, OR */
+						case 0x26: case 0x27: /* XOR, NOR */
+						case 0x2A: case 0x2B: /* SLT, SLTU */
+							native_stats.native_alu++;
+							is_native = true;
+							break;
+						/* Native shifts */
+						case 0x00: case 0x02: case 0x03: /* SLL, SRL, SRA */
+						case 0x04: case 0x06: case 0x07: /* SLLV, SRLV, SRAV */
+							native_stats.native_shift++;
+							is_native = true;
+							break;
+						/* Native multiply/divide */
+						case 0x18: case 0x19: /* MULT, MULTU */
+						case 0x1A: case 0x1B: /* DIV, DIVU */
+						case 0x10: case 0x11: /* MFHI, MTHI */
+						case 0x12: case 0x13: /* MFLO, MTLO */
+							native_stats.native_muldiv++;
+							is_native = true;
+							break;
+						/* Native jumps */
+						case 0x08: case 0x09: /* JR, JALR */
+							native_stats.native_jump++;
+							is_native = true;
+							break;
+						/* SYSCALL, BREAK - need emulation */
+						case 0x0C: case 0x0D:
+							native_stats.emulated_syscall++;
+							block_is_pure = false;
+							break;
+						default:
+							native_stats.emulated_other++;
+							block_is_pure = false;
+							break;
+					}
+					break;
+				case 0x01: /* REGIMM - branches */
+					native_stats.native_branch++;
+					is_native = true;
+					break;
+				case 0x02: case 0x03: /* J, JAL */
+					native_stats.native_jump++;
+					is_native = true;
+					break;
+				case 0x04: case 0x05: /* BEQ, BNE */
+				case 0x06: case 0x07: /* BLEZ, BGTZ */
+					native_stats.native_branch++;
+					is_native = true;
+					break;
+				/* Native immediate ops */
+				case 0x08: case 0x09: /* ADDI, ADDIU */
+				case 0x0A: case 0x0B: /* SLTI, SLTIU */
+				case 0x0C: case 0x0D: /* ANDI, ORI */
+				case 0x0E: case 0x0F: /* XORI, LUI */
+					native_stats.native_imm++;
+					is_native = true;
+					break;
+				/* COP0 - need emulation */
+				case 0x10:
+					native_stats.emulated_cop0++;
+					block_is_pure = false;
+					break;
+				/* COP2/GTE - need emulation */
+				case 0x12:
+					native_stats.emulated_cop2++;
+					block_is_pure = false;
+					break;
+				/* Load instructions - need address translation */
+				case 0x20: case 0x21: case 0x22: case 0x23: /* LB, LH, LWL, LW */
+				case 0x24: case 0x25: case 0x26: /* LBU, LHU, LWR */
+				case 0x32: /* LWC2 */
+					native_stats.emulated_load++;
+					block_is_pure = false;
+					break;
+				/* Store instructions - need address translation */
+				case 0x28: case 0x29: case 0x2A: case 0x2B: /* SB, SH, SWL, SW */
+				case 0x2E: /* SWR */
+				case 0x3A: /* SWC2 */
+					native_stats.emulated_store++;
+					block_is_pure = false;
+					break;
+				default:
+					native_stats.emulated_other++;
+					block_is_pure = false;
+					break;
+			}
+			(void)is_native; /* Suppress unused warning - used for future direct exec */
+		}
+
 		recBSC[psxRegs.code>>26]();
 		regUpdate();
 	} while (!end_block);
 
+	/* v236: MODE 3 = NATIVE EXECUTION
+	 * Try native compilation, use native if successful, fallback to dynarec
+	 */
+	if (g_opt_native_mode == 3) {
+		/* v245: Skip native if all commands disabled in menu */
+		extern int native_any_cmd_enabled;
+		if (!native_any_cmd_enabled) {
+			dynarec_used++;
+			goto native_block_done;
+		}
+
+		/* Calculate dynarec instruction count */
+		int dynarec_instr_count = (pc - block_start_pc) / 4;
+
+		/* v242: Limit instruction count to prevent overflow
+		 * Each instruction can generate ~50 bytes worst case
+		 * 32KB buffer / 50 bytes = ~640 instructions max
+		 * Use 500 as safe limit */
+		#define MODE3_MAX_INSTRS 500
+		if (dynarec_instr_count > MODE3_MAX_INSTRS) {
+			/* Block too large for native, use dynarec */
+			dynarec_used++;
+			goto native_block_done;
+		}
+
+		/* Save current recMem position (end of dynarec code) */
+		u32* recMemAfterDynarec = recMem;
+		u32 dynarec_code_size = ((u8*)recMem - (u8*)recMemBlockStart);
+		(void)dynarec_code_size;
+
+		/* v242: Re-init guards before each attempt to ensure clean detection */
+		init_overflow_guards();
+
+		/* Try native compilation to temp buffer */
+		recMem = (u32*)native_try_buffer;
+		u32* native_start = recMem;
+
+		if (native_compile_block(block_start_pc, dynarec_instr_count)) {
+			/* Native succeeded! Add epilogue */
+			rec_recompile_end_part1();
+			rec_recompile_end_part2(false);
+
+			u32 native_code_size = ((u8*)recMem - (u8*)native_start);
+
+			/* v238: Check for overflow BEFORE using the code */
+			if (check_native_try_overflow()) {
+				xlog("!!! MODE 3: native_try_buffer OVERFLOW! size=%d, max=%d\n",
+				     native_code_size, NATIVE_TRY_BUF_SIZE);
+				xlog("!!! Block PC=%08X, instr_count=%d\n", block_start_pc, dynarec_instr_count);
+				init_overflow_guards();  /* Reset guards */
+				recMem = recMemAfterDynarec;
+				dynarec_used++;
+			}
+			/* Copy native code to main buffer (overwrite dynarec) */
+			else if (native_code_size <= NATIVE_TRY_BUF_SIZE) {
+				memcpy(recMemBlockStart, native_try_buffer, native_code_size);
+				recMem = (u32*)((u8*)recMemBlockStart + native_code_size);
+				native_compiled = true;
+				/* v244: native_used already incremented in native_compile_block() */
+
+#ifdef __mips__
+				__builtin___clear_cache((char*)recMemBlockStart, (char*)recMem);
+				__sync_synchronize();
+#endif
+			} else {
+				xlog("!!! MODE 3: native too big! size=%d, max=%d\n",
+				     native_code_size, NATIVE_TRY_BUF_SIZE);
+				recMem = recMemAfterDynarec;
+				dynarec_used++;
+			}
+		} else {
+			recMem = recMemAfterDynarec;
+			dynarec_used++;
+		}
+	}
+
+#if DIFF_TEST_ENABLE
+	/* v236: MODE 4 = DIFF_TEST
+	 * Compile native to separate buffer for comparison during execution
+	 */
+	if (g_opt_native_mode == 4) {
+		/* Calculate dynarec instruction count */
+		int dynarec_instr_count = (pc - diff_test_start_pc) / 4;
+
+		u32 lut_idx = pc_to_lut_idx(diff_test_start_pc);
+
+		/* v240: Like v235 - just stop compiling when buffer full, no reset
+		 * Check: slot empty AND buffer has space (at least 8KB for safety) */
+		if (native_block_lut[lut_idx] == NULL &&
+		    (native_code_ptr + 8192) < native_code_end)
+		{
+			/* Save current recMem position */
+			u32* saved_recMem = recMem;
+
+			/* Point recMem to native code buffer */
+			recMem = (u32*)native_code_ptr;
+			u32* native_start = recMem;
+
+			/* Try native compilation with EXACT instruction count */
+			if (native_compile_block(diff_test_start_pc, dynarec_instr_count)) {
+				/* Native succeeded! */
+				rec_recompile_end_part1();
+				rec_recompile_end_part2(false);
+
+				u32 native_code_size = ((u8*)recMem - (u8*)native_start);
+
+				/* v238: Check bounds AFTER compilation */
+				if ((u8*)recMem > native_code_end || check_native_code_overflow()) {
+					xlog("!!! MODE 4: native_code_buffer OVERFLOW! size=%d\n", native_code_size);
+					xlog("!!! recMem=%08X, end=%08X, PC=%08X, instrs=%d\n",
+					     (u32)recMem, (u32)native_code_end, diff_test_start_pc, dynarec_instr_count);
+					init_native_code_guard();  /* Reset guard */
+					/* Don't store in LUT - block is corrupted */
+				} else {
+					/* Store in lookup table WITH PC for verification */
+					native_block_lut[lut_idx] = native_start;
+					native_block_pc[lut_idx] = diff_test_start_pc;
+					diff_native_compiled++;
+
+					/* Advance native buffer pointer */
+					native_code_ptr = (u8*)recMem;
+
+					/* Flush cache for native code */
+#ifdef __mips__
+					__builtin___clear_cache((char*)native_start, (char*)recMem);
+					__sync_synchronize();
+#endif
+				}
+			}
+
+			/* Restore recMem for any later operations */
+			recMem = saved_recMem;
+		}
+	}
+#endif
+
+	/* v115: Update block classification stats (for SEMI mode analysis) */
+	if (g_opt_native_mode >= 1) {
+		native_stats.blocks_total++;
+		if (block_is_pure)
+			native_stats.blocks_pure_alu++;
+	}
+
+native_block_done:
+	/* v118: Track if block was natively compiled */
+	if (native_compiled) {
+		native_stats.blocks_total++;
+		native_stats.blocks_pure_alu++;
+	}
+
 	DISASM_HOST();
 	clear_insn_cache(recMemStart, recMem, 0);
+
+	PROFILE_END(PROF_CPU_COMPILE);
 }
 
 
@@ -556,6 +1431,12 @@ static int recInit()
 			fill_size = RECMEM_SIZE;
 		memset(recMemBase, 0xff, fill_size);
 	}
+
+	/* v238: Initialize overflow guards */
+	init_overflow_guards();
+#if DIFF_TEST_ENABLE
+	init_native_code_guard();
+#endif
 
 	// The tables recRAM and recROM hold block code pointers for all valid PC
 	//  values for a PS1 program, after masking away banking and/or mirroring.
@@ -692,6 +1573,8 @@ __attribute__((noinline)) static void recFunc(void *fn)
  */
 __attribute__((noinline)) void recExecute_indirect_return_lut()
 {
+	/* v141: Removed verbose entry logging */
+
 	// Set block_ret_addr to 0, so generated code uses indirect returns
 	block_ret_addr = block_fast_ret_addr = 0;
 
@@ -700,18 +1583,78 @@ __attribute__((noinline)) void recExecute_indirect_return_lut()
 
 #ifndef ASM_EXECUTE_LOOP
 	emu_frame_complete = 0;
+
+	/* v112: Cycle batching - check less frequently for speed */
+	/* batch_mask: 0=every block, 1=every 2, 3=every 4, 7=every 8 */
+	const u32 batch_mask = (1 << g_opt_cycle_batch) - 1;  /* 0, 1, 3, 7 */
+	u32 batch_counter = 0;
+
 	for (;;) {
-		u32 *p = (u32*)PC_REC(psxRegs.pc);
-		if (*p == 0)
-			recRecompile();
+		u32 pc = psxRegs.pc;
+		void *code;
 
-		recFunc((void *)*p);
+		/* v113: Hot Block Cache - fast path for cached blocks */
+		code = hbc_lookup(pc);
+		if (code == NULL) {
+			/* Cache miss - normal lookup */
+			u32 *p = (u32*)PC_REC(pc);
+			if (*p == 0)
+				recRecompile();
+			code = (void*)*p;
+			/* Store in cache for next time */
+			hbc_store(pc, code);
+		}
 
-		if (psxRegs.cycle >= psxRegs.io_cycle_counter)
+#if NATIVE_EXEC_DEBUG
+		/* v132: Enhanced logging - track loops even after log limit */
+		bool is_new_pc = (pc != native_last_pc);
+
+		if (is_new_pc) {
+			/* Log exit from previous loop if there was one */
+			if (native_loop_count > 1 && native_exec_log_count < NATIVE_EXEC_LOG_LIMIT) {
+				xlog("EXEC: (loop x%d)", native_loop_count);
+			}
+			native_loop_count = 0;
+			if (native_exec_log_count < NATIVE_EXEC_LOG_LIMIT) {
+				xlog("EXEC: [%d] >> PC=%08X ptr=%p", native_exec_log_count, pc, code);
+			}
+		} else {
+			/* v132: Periodic logging for infinite loops */
+			if (native_loop_count > 0 && (native_loop_count % 50000) == 0) {
+				xlog("EXEC: STILL LOOPING PC=%08X count=%u", pc, native_loop_count);
+			}
+		}
+#endif
+
+		recFunc(code);
+
+		/* v139: Cycle counting now works via $v1!
+		 * Native blocks set $v1 = count AFTER emit_save_gprs(),
+		 * and recFunc's dispatcher adds $v1 to psxRegs.cycle.
+		 * No extra handling needed - same as dynarec blocks!
+		 */
+
+#if NATIVE_EXEC_DEBUG
+		if (is_new_pc && native_exec_log_count < NATIVE_EXEC_LOG_LIMIT) {
+			xlog("EXEC: [%d] << PC=%08X -> %08X", native_exec_log_count, pc, psxRegs.pc);
+			native_exec_log_count++;
+		}
+		native_loop_count++;
+		native_last_pc = pc;
+#endif
+
+		/* v138: FORCE psxBranchTest on EVERY block for debugging!
+		 * This ensures interrupts are checked even if native blocks
+		 * don't accumulate enough cycles.
+		 */
+		if (psxRegs.cycle >= psxRegs.io_cycle_counter) {
+			/* v192: DISP logging disabled for performance */
 			psxBranchTest();
+		}
 
 		// QPSX_039: Return after frame for libretro input/video
 		if (emu_frame_complete) {
+			/* v141: Removed verbose frame return logging */
 			emu_frame_complete = 0;
 			return;
 		}
@@ -883,6 +1826,8 @@ __attribute__((noinline)) static void recExecute_indirect_return_mmap()
 			recRecompile();
 
 		recFunc((void *)*p);
+
+		/* v139: Cycles handled via $v1 in recFunc */
 
 		if (psxRegs.cycle >= psxRegs.io_cycle_counter)
 			psxBranchTest();
@@ -1501,11 +2446,75 @@ __attribute__((noinline)) static void recExecuteBlock(unsigned target_pc)
 		if (*p == 0)
 			recRecompile();
 
-		recFunc((void *)*p);
+		/* v236: Unified native mode switching
+		 * mode 3 = NATIVE: run native block (if available), fallback to dynarec
+		 * mode 4 = DIFF_TEST: run dynarec, compare with native, log mismatches
+		 * other = pure dynarec
+		 */
+#if DIFF_TEST_ENABLE
+		if (g_opt_native_mode == 4) {
+			/* MODE 4: DIFF_TEST - dynarec main, compare with native */
+			u32 block_pc = psxRegs.pc;
 
+			static psxRegisters regs_before __attribute__((aligned(4)));
+			static psxRegisters regs_dynarec __attribute__((aligned(4)));
+			memcpy(&regs_before, &psxRegs, sizeof(psxRegisters));
 
+			/* Run DYNAREC (main execution) */
+			recFunc((void *)*p);
+			dynarec_fallback_count++;
+
+			memcpy(&regs_dynarec, &psxRegs, sizeof(psxRegisters));
+
+			/* Check if we have native block for this PC */
+			u32 lut_idx = pc_to_lut_idx(block_pc);
+			void* native_block = NULL;
+			if (lut_idx < NATIVE_LUT_SIZE &&
+			    native_block_lut[lut_idx] != NULL &&
+			    native_block_pc[lut_idx] == block_pc)
+			{
+				native_block = native_block_lut[lut_idx];
+			}
+
+			if (native_block) {
+				/* Restore state, run native, compare */
+				memcpy(&psxRegs, &regs_before, sizeof(psxRegisters));
+				recFunc(native_block);
+				native_exec_count++;
+
+				bool mismatch = diff_test_compare(block_pc, &regs_before, &regs_dynarec, &psxRegs);
+				(void)mismatch;
+
+				/* ALWAYS restore dynarec result */
+				memcpy(&psxRegs, &regs_dynarec, sizeof(psxRegisters));
+			}
+		} else
+#endif
+		{
+			/* MODE 3 or other: just run the block (native or dynarec) */
+#if NATIVE_DEBUG_RING
+			if (g_opt_native_mode == 3) {
+				native_debug_ring_add(psxRegs.pc, (u32)*p, true);
+			}
+#endif
+			recFunc((void *)*p);
+#if NATIVE_DEBUG_RING
+			if (g_opt_native_mode == 3) {
+				native_debug_ring_complete();
+			}
+#endif
+		}
+
+		/* v139: Cycles handled via $v1 in recFunc */
 
 		if (psxRegs.cycle >= psxRegs.io_cycle_counter) {
+#if NATIVE_DEBUG_RING
+			/* v237: Dump ring buffer at each psxBranchTest for debugging */
+			if (g_opt_native_mode == 3 && branch_test_count >= 8) {
+				native_debug_ring_dump();
+			}
+			branch_test_count++;
+#endif
 			psxBranchTest();
 			// QPSX_047: Exit loop when in BIOS mode after interrupt
 			if (target_pc == 0) break;
@@ -1681,8 +2690,251 @@ __asm__ __volatile__ (
 }
 
 
+/***************************************************************************
+ * QPSX v100: Direct Block LUT Dispatch Loop
+ *
+ * OPTIMIZATION: Replaces 2-level psxRecLUT lookup with direct lookup.
+ *
+ * OLD (psxRecLUT - 8 instructions, 2 memory loads):
+ *   lui   $t1, %hi(psxRecLUT)
+ *   srl   $t2, $v0, 16
+ *   sll   $t2, $t2, 2
+ *   addu  $t1, $t1, $t2
+ *   lw    $t1, %lo(psxRecLUT)($t1)    <- LOAD #1
+ *   andi  $t0, $v0, 0xffff
+ *   addu  $t2, $t0, $t1
+ *   lw    $t0, 0($t2)                 <- LOAD #2
+ *
+ * NEW (Direct - 4 instructions, 1 memory load for RAM path):
+ *   li    $t1, 0x1FFFFC               (or use pre-loaded $s2)
+ *   and   $t2, $v0, $t1               (mask to 2MB, word-aligned)
+ *   addu  $t2, $s0, $t2               ($s0 = recRAM base, pre-loaded)
+ *   lw    $t0, 0($t2)                 <- ONLY 1 LOAD!
+ *
+ * SAVINGS: 4 instructions + 1 memory load per dispatch = ~10-15 cycles
+ * With 100K+ dispatches/frame, this is 1-2ms improvement!
+ *
+ * ROM (0xBFCxxxxx) is handled with branch to separate path (rare after boot).
+ ***************************************************************************/
+
+/* v101: Direct Block LUT controlled by menu option (default OFF) */
+extern int g_opt_direct_block_lut;  /* Defined in libretro-core.cpp */
+/* v112: g_opt_cycle_batch declared near top of file */
+
+__attribute__((noinline)) static void recExecute_direct_block_lut()
+{
+	// Set block_ret_addr to 0, so generated code uses indirect returns
+	block_ret_addr = block_fast_ret_addr = 0;
+
+	// QPSX_039: Frame complete flag - must return after VBlank for libretro
+	extern volatile int emu_frame_complete;
+
+#ifndef ASM_EXECUTE_LOOP
+	/* C fallback - same as lut version but with direct lookup */
+	emu_frame_complete = 0;
+
+	/* v112: Cycle batching - check less frequently for speed */
+	/* batch_mask: 0=every block, 1=every 2, 3=every 4, 7=every 8 */
+	const u32 batch_mask = (1 << g_opt_cycle_batch) - 1;  /* 0, 1, 3, 7 */
+	u32 batch_counter = 0;
+
+	for (;;) {
+		u32 pc = psxRegs.pc;
+		void *code;
+
+		/* v113: Hot Block Cache - fast path for cached blocks */
+		code = hbc_lookup(pc);
+		if (code == NULL) {
+			/* Cache miss - direct lookup: RAM or ROM? */
+			u32 *p;
+			if ((pc >> 20) == 0xBFC) {
+				/* ROM: 0xBFC00000-0xBFC7FFFF */
+				p = (u32*)(recROM + (pc & 0x7FFFC));
+			} else {
+				/* RAM: All other addresses (0x00/0x80/0xA0 mirrors) */
+				p = (u32*)(recRAM + (pc & 0x1FFFFC));
+			}
+
+			if (*p == 0)
+				recRecompile();
+
+			code = (void*)*p;
+			/* Store in cache for next time */
+			hbc_store(pc, code);
+		}
+
+		recFunc(code);
+
+		/* v139: Cycles handled via $v1 in recFunc */
+
+		/* v112: Only check cycles every N blocks based on batch level */
+		if ((batch_counter++ & batch_mask) == 0) {
+			if (psxRegs.cycle >= psxRegs.io_cycle_counter)
+				psxBranchTest();
+		}
+
+		if (emu_frame_complete) {
+			emu_frame_complete = 0;
+			return;
+		}
+	}
+#else
+/* QPSX v100: Optimized ASM dispatch with Direct Block LUT */
+emu_frame_complete = 0;
+
+__asm__ __volatile__ (
+".set push                                    \n"
+".set noreorder                               \n"
+
+/* Setup: $fp = &psxRegs (standard, kept across all blocks) */
+"la    $fp, %[psxRegs]                        \n"
+
+/* Stack frame */
+".equ  frame_size,                  32        \n"
+".equ  f_off_temp_var1,             28        \n"
+".equ  f_off_recrom,                24        \n"
+".equ  f_off_block_ret_addr,        16        \n"
+"addiu $sp, $sp, -frame_size                  \n"
+
+/* v100 OPTIMIZATION: Pre-load recRAM base into $s0 */
+"la    $s0, %[recRAM]                         \n"
+"lw    $s0, 0($s0)                            \n"  /* $s0 = recRAM pointer */
+
+/* v100: Pre-load recROM base (store on stack for ROM fallback) */
+"la    $t0, %[recROM]                         \n"
+"lw    $t0, 0($t0)                            \n"
+"sw    $t0, f_off_recrom($sp)                 \n"
+
+/* v100: Pre-load masks into saved regs for speed */
+"li    $s1, 0x1FFFFC                          \n"  /* RAM mask (2MB, word-aligned) */
+"li    $s2, 0x7FFFC                           \n"  /* ROM mask (512KB, word-aligned) */
+"li    $s3, 0xBFC                             \n"  /* ROM upper bits check */
+
+/* Store block return address */
+"la    $t0, loop_dbl%=                        \n"
+"sw    $t0, f_off_block_ret_addr($sp)         \n"
+
+/* Load initial PC */
+"lw    $v0, %[psxRegs_pc_off]($fp)            \n"
+"move  $v1, $0                                \n"
+
+/* Align loop on cache line for better I-cache performance */
+".balign 32                                   \n"
+
+/*==========================================================================
+ * MAIN DISPATCH LOOP - DIRECT BLOCK LUT (v100)
+ *
+ * Pseudocode:
+ *   loop:
+ *     if ((pc >> 20) == 0xBFC) goto rom_lookup;  // Rare
+ *     block_ptr = *(recRAM + (pc & 0x1FFFFC));   // Direct RAM lookup!
+ *     psxRegs.cycle += cycles;
+ *     if (cycle >= io_cycle_counter) goto branch_test;
+ *     if (block_ptr == 0) goto recompile;
+ *     execute(block_ptr);
+ *==========================================================================*/
+
+"loop_dbl%=:                                  \n"
+
+/* v100: Direct lookup - check for ROM first (upper 12 bits == 0xBFC) */
+"srl   $t3, $v0, 20                           \n"  /* Upper 12 bits of PC */
+"beq   $t3, $s3, rom_lookup_dbl%=             \n"  /* If 0xBFC, goto ROM path */
+"lw    $t4, %[psxRegs_cycle_off]($fp)         \n"  /* <BD> Load cycle (interleaved) */
+
+/*----------------------------------------------------------------------
+ * RAM PATH (99%+ of lookups) - OPTIMIZED DIRECT LOOKUP
+ * Only 3 instructions + 1 load (vs 7 instructions + 2 loads before!)
+ *----------------------------------------------------------------------*/
+"and   $t2, $v0, $s1                          \n"  /* $t2 = pc & 0x1FFFFC */
+"addu  $t2, $s0, $t2                          \n"  /* $t2 = recRAM + offset */
+"lw    $t0, 0($t2)                            \n"  /* $t0 = block_ptr (ONLY 1 LOAD!) */
+
+"ram_continue_dbl%=:                          \n"
+/* Cycle counting (interleaved with lookup to hide load latency) */
+"lw    $t5, %[psxRegs_io_cycle_ctr_off]($fp)  \n"  /* $t5 = io_cycle_counter */
+"addu  $t4, $t4, $v1                          \n"  /* $t4 = cycle + $v1 */
+
+/* Branch test check */
+"sltu  $t5, $t4, $t5                          \n"
+"beqz  $t5, call_psxBranchTest_dbl%=          \n"
+"sw    $t4, %[psxRegs_cycle_off]($fp)         \n"  /* <BD> Store updated cycle */
+
+/* Recompile if block not yet compiled */
+"beqz  $t0, recompile_block_dbl%=             \n"
+"sw    $v0, %[psxRegs_pc_off]($fp)            \n"  /* <BD> Store new PC */
+
+/* Execute block - it returns to loop_dbl with new $v0, $v1 */
+"execute_block_dbl%=:                         \n"
+"jr    $t0                                    \n"
+"lw    $ra, f_off_block_ret_addr($sp)         \n"  /* <BD> Load return address */
+
+/*----------------------------------------------------------------------
+ * ROM PATH (rare - only BIOS, called <0.1% of time after boot)
+ * Uses separate lookup from recROM table
+ *----------------------------------------------------------------------*/
+"rom_lookup_dbl%=:                            \n"
+"and   $t2, $v0, $s2                          \n"  /* $t2 = pc & 0x7FFFC */
+"lw    $t6, f_off_recrom($sp)                 \n"  /* $t6 = recROM base */
+"addu  $t2, $t6, $t2                          \n"  /* $t2 = recROM + offset */
+"b     ram_continue_dbl%=                     \n"
+"lw    $t0, 0($t2)                            \n"  /* <BD> Load block ptr */
+
+/*----------------------------------------------------------------------
+ * NON-LOOP CODE
+ *----------------------------------------------------------------------*/
+
+/* psxBranchTest() call */
+"call_psxBranchTest_dbl%=:                    \n"
+"jal   %[psxBranchTest]                       \n"
+"sw    $v0, %[psxRegs_pc_off]($fp)            \n"  /* <BD> Store PC (exception might change it) */
+
+/* Check frame complete flag */
+"lui   $t5, %%hi(%[emu_frame_complete])       \n"
+"lw    $t6, %%lo(%[emu_frame_complete])($t5)  \n"
+"bnez  $t6, exit_dbl%=                        \n"  /* Exit if frame done */
+"nop                                          \n"
+
+/* Reload PC and continue */
+"lw    $v0, %[psxRegs_pc_off]($fp)            \n"
+"b     loop_dbl%=                             \n"
+"move  $v1, $0                                \n"  /* <BD> Reset cycle delta */
+
+/* Block recompilation */
+"recompile_block_dbl%=:                       \n"
+"jal   %[recRecompile]                        \n"
+"sw    $t2, f_off_temp_var1($sp)              \n"  /* <BD> Save block ptr addr */
+"lw    $t2, f_off_temp_var1($sp)              \n"  /* Restore ptr addr */
+"lw    $v0, %[psxRegs_pc_off]($fp)            \n"  /* Reload PC (blocks expect this) */
+"b     execute_block_dbl%=                    \n"
+"lw    $t0, 0($t2)                            \n"  /* <BD> Load compiled block ptr */
+
+/* Exit - frame complete */
+"exit_dbl%=:                                  \n"
+"addiu $sp, $sp, frame_size                   \n"
+".set pop                                     \n"
+
+: /* Output */
+: /* Input */
+  [psxRegs]                    "i" (&psxRegs),
+  [psxRegs_pc_off]             "i" (off(pc)),
+  [psxRegs_cycle_off]          "i" (off(cycle)),
+  [psxRegs_io_cycle_ctr_off]   "i" (off(io_cycle_counter)),
+  [recRecompile]               "i" (&recRecompile),
+  [psxBranchTest]              "i" (&psxBranchTest),
+  [recRAM]                     "i" (&recRAM),
+  [recROM]                     "i" (&recROM),
+  [emu_frame_complete]         "i" (&emu_frame_complete)
+: /* Clobber */
+  "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp", "ra", "memory"
+);
+#endif
+}
+
+
 static void recExecute()
 {
+	PROFILE_START(PROF_CPU_TOTAL);
+
 	// QPSX_039: Only reset code cache on first call
 	// Prevents slow frame execution caused by clearing cache every frame
 	static bool rec_initialized = false;
@@ -1719,6 +2971,30 @@ static void recExecute()
 	use_indirect_return_dispatch_loop = Config.HLE;
 #endif
 
+	/*
+	 * QPSX v101: Direct Block LUT controlled by menu option (default OFF)
+	 * This eliminates the 2-level psxRecLUT lookup, saving ~10-15 cycles per dispatch.
+	 * Falls back to standard lut dispatch if rec_mem_mapped (virtual mapping active).
+	 *
+	 * v129: DISABLED when NATIVE_EXEC_DEBUG is enabled - forces C dispatch for logging
+	 */
+#ifdef SF2000
+#if !NATIVE_EXEC_DEBUG
+	if (g_opt_direct_block_lut && !rec_mem_mapped) {
+		recExecute_direct_block_lut();
+		PROFILE_END(PROF_CPU_TOTAL);
+		return;
+	}
+#else
+	/* v130: Log once, not every call */
+	static bool debug_msg_shown = false;
+	if (!debug_msg_shown) {
+		xlog("EXEC: v130 DEBUG - using C dispatch for logging");
+		debug_msg_shown = true;
+	}
+#endif
+#endif
+
 	if (use_indirect_return_dispatch_loop) {
 		if (rec_mem_mapped)
 			recExecute_indirect_return_mmap();
@@ -1730,11 +3006,14 @@ static void recExecute()
 		else
 			recExecute_direct_return_lut();
 	}
+
+	PROFILE_END(PROF_CPU_TOTAL);
 }
 
 
-/* Invalidate 'Size' code block pointers at word-aligned PS1 address 'Addr'. */
-static void recClear(u32 Addr, u32 Size)
+/* Invalidate 'Size' code block pointers at word-aligned PS1 address 'Addr'.
+ * v101: extern "C" for psxmem_asm.S linkage */
+extern "C" void recClear(u32 Addr, u32 Size)
 {
 	const u32 masked_ram_addr = Addr & 0x1ffffc;
 
@@ -1757,6 +3036,8 @@ static void recClear(u32 Addr, u32 Size)
 	if (has_code) {
 		void *dst = (void*)(dst_base + (masked_ram_addr * REC_RAM_PTR_SIZE/4));
 		memset(dst, 0, Size*REC_RAM_PTR_SIZE);
+		/* v113: Clear Hot Block Cache when code is invalidated */
+		hbc_clear();
 	}
 }
 
@@ -1842,6 +3123,12 @@ static void recReset()
 
 	// Set default recompilation options and any per-game options
 	rec_set_options();
+
+	/* v113: Initialize/update Hot Block Cache based on current settings */
+	hbc_init();
+
+	/* v117: Reset cumulative native mode stats when code cache is cleared */
+	memset(&native_stats, 0, sizeof(native_stats));
 }
 
 

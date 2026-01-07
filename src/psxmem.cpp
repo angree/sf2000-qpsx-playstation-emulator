@@ -30,6 +30,46 @@
 #include "psxmem.h"
 #include "r3000a.h"
 #include "psxhw.h"
+#include "profiler.h"  /* v094: Detailed CPU profiling */
+
+/* v103: Memory optimization flags from libretro-core.cpp */
+extern int g_opt_skip_code_inv;   /* Skip code invalidation after stores (RISK!) */
+/*
+ * v104: g_opt_asm_memwrite - 7 levels (0-6) for precise debugging
+ *
+ * FIXED in v104: Split address calculation into separate asm blocks!
+ *
+ * The v103 bug was: "=&r" constraint only prevents overlap with INPUTS,
+ * NOT with other OUTPUTS. GCC could allocate same register for t and m,
+ * causing corruption when the second instruction overwrote the first's result.
+ *
+ * Fix: One instruction per asm block guarantees distinct registers
+ * because both t and m are live after both asm blocks.
+ *
+ * Levels:
+ *   0 = OFF      : Pure C path (baseline)
+ *   1 = V98      : ASM(ptr_arith + store), C(addr_calc, HW, LUT, codeinv) - WORKS!
+ *   2 = +ADDR    : ASM(addr_calc + ptr_arith + store), C(HW, LUT, codeinv)
+ *   3 = +LUT     : ASM(addr_calc + LUT + ptr_arith + store), C(HW, codeinv)
+ *   4 = +HWBR    : ASM(addr_calc + LUT + HW_branch + ptr_arith + store), C(HW_call, codeinv)
+ *   5 = +HWCALL  : ASM(everything except codeinv), C(codeinv only)
+ *   6 = FULL     : Full psxmem_asm.S (everything in ASM)
+ */
+extern int g_opt_asm_memwrite;
+
+/* v099: Pure assembly memory functions (defined in psxmem_asm.S) */
+#if defined(SF2000) || defined(__mips__)
+extern "C" {
+    /* Write functions */
+    void psxMemWrite32_asm(u32 mem, u32 value);
+    void psxMemWrite16_asm(u32 mem, u16 value);
+    void psxMemWrite8_asm(u32 mem, u8 value);
+    /* Read functions */
+    u32 psxMemRead32_asm(u32 mem);
+    u16 psxMemRead16_asm(u32 mem);
+    u8 psxMemRead8_asm(u32 mem);
+}
+#endif
 
 /* SF2000: xlog for debug output */
 #ifdef SF2000
@@ -72,6 +112,30 @@ bool psxP_allocated;
 bool psxR_allocated;
 bool psxH_allocated;
 
+/*
+ * QPSX_232_TEST: Fixed memory address experiment!
+ *
+ * Hypothesis: If we place psxM at a fixed, known address, we can
+ * optimize native code by using LUI instead of dynamic LW for base pointer.
+ *
+ * SF2000 memory map:
+ *   0x80000000-0x80C00000+ : Firmware (code, data, $gp)
+ *   0x8???????            : gp_buf_64m heap (unknown exact location)
+ *   0x87000000+           : Core load address
+ *
+ * v234: Changed from 0x84000000 to 0x85000000
+ * 0x84000000 was inside gp_buf_64m (0x80c10834 - 0x84c10834)
+ * 0x85000000 is OUTSIDE that buffer - should be safer
+ *
+ * RISK: May crash if this memory is used by something else!
+ */
+#define QPSX_FIXED_PSXM_ADDR    0x85000000
+#define QPSX_FIXED_PSXM_SIZE    0x200000    /* 2MB PSX RAM */
+#define QPSX_USE_FIXED_ADDR     1           /* 1=use fixed, 0=use malloc */
+
+/* Track if we're using fixed address (to prevent free() on fixed addr) */
+static bool psxM_is_fixed_addr = false;
+
 u8 **psxMemWLUT;
 u8 **psxMemRLUT;
 
@@ -108,7 +172,92 @@ int psxMemInit()
 	//  making a standard pointer NULLness check inappropriate.
 
 	// Allocate 2MB for PSX RAM
+#if QPSX_USE_FIXED_ADDR && defined(SF2000)
+	/*
+	 * QPSX_232_TEST: Fixed memory address experiment!
+	 *
+	 * Instead of malloc, we use a FIXED address: 0x84000000
+	 * This is 64MB from KSEG0 start (0x80000000).
+	 *
+	 * Benefits:
+	 *   - Native code can use LUI to load base address (1 instruction)
+	 *   - No need to load psxM pointer from memory (saves LW)
+	 *   - Potentially huge speedup for memory-intensive code
+	 *
+	 * Risks:
+	 *   - May collide with firmware or heap memory
+	 *   - Will crash if memory is not accessible
+	 *
+	 * Memory test: Write pattern, read back, verify.
+	 */
+	if (!psxM_allocated) {
+		xlog("QPSX_232_TEST: Using FIXED address 0x%08X for PSX RAM!\n", QPSX_FIXED_PSXM_ADDR);
+		psxM = (s8*)QPSX_FIXED_PSXM_ADDR;
+
+		/* Memory integrity test - write pattern and verify */
+		xlog("QPSX_232_TEST: Testing memory integrity...\n");
+		volatile u32 *test_ptr = (volatile u32*)psxM;
+		int test_ok = 1;
+
+		/* Test 1: Write/read first 16 words */
+		xlog("QPSX_232_TEST: Test 1 - First 16 words at 0x%08X\n", (u32)test_ptr);
+		for (i = 0; i < 16; i++) {
+			test_ptr[i] = 0xDEAD0000 | i;
+		}
+		for (i = 0; i < 16; i++) {
+			u32 val = test_ptr[i];
+			u32 expected = 0xDEAD0000 | i;
+			if (val != expected) {
+				xlog("QPSX_232_TEST: FAIL at offset %d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
+				test_ok = 0;
+			}
+		}
+
+		/* Test 2: Write/read at 1MB offset (middle of 2MB) */
+		volatile u32 *mid_ptr = (volatile u32*)((u8*)psxM + 0x100000);
+		xlog("QPSX_232_TEST: Test 2 - Middle at 0x%08X\n", (u32)mid_ptr);
+		for (i = 0; i < 16; i++) {
+			mid_ptr[i] = 0xBEEF0000 | i;
+		}
+		for (i = 0; i < 16; i++) {
+			u32 val = mid_ptr[i];
+			u32 expected = 0xBEEF0000 | i;
+			if (val != expected) {
+				xlog("QPSX_232_TEST: FAIL at 1MB+%d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
+				test_ok = 0;
+			}
+		}
+
+		/* Test 3: Write/read at end (near 2MB) */
+		volatile u32 *end_ptr = (volatile u32*)((u8*)psxM + 0x1FFFC0);  /* 2MB - 64 bytes */
+		xlog("QPSX_232_TEST: Test 3 - End at 0x%08X\n", (u32)end_ptr);
+		for (i = 0; i < 16; i++) {
+			end_ptr[i] = 0xCAFE0000 | i;
+		}
+		for (i = 0; i < 16; i++) {
+			u32 val = end_ptr[i];
+			u32 expected = 0xCAFE0000 | i;
+			if (val != expected) {
+				xlog("QPSX_232_TEST: FAIL at end+%d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
+				test_ok = 0;
+			}
+		}
+
+		if (test_ok) {
+			xlog("QPSX_232_TEST: Memory test PASSED! Fixed address is usable.\n");
+			psxM_allocated = true;
+			psxM_is_fixed_addr = true;  /* Mark as fixed - don't free() later! */
+		} else {
+			xlog("QPSX_232_TEST: Memory test FAILED! Falling back to malloc.\n");
+			psxM = (s8*)malloc(0x200000);
+			psxM_allocated = psxM != NULL;
+			xlog("QPSX_232_TEST: malloc fallback: psxM=0x%08X\n", (u32)psxM);
+		}
+	}
+#else
+	/* Standard malloc path for non-SF2000 or when QPSX_USE_FIXED_ADDR=0 */
 	if (!psxM_allocated) { psxM = (s8*)malloc(0x200000);  psxM_allocated = psxM != NULL; }
+#endif
 
 	// Allocate 64K for PSX ROM expansion 0x1f00_0000 region
 	if (!psxP_allocated) { psxP = (s8*)malloc(0x10000);   psxP_allocated = psxP != NULL; }
@@ -156,6 +305,7 @@ void psxMemReset()
 {
 #ifdef SF2000
 	xlog("QPSX: >>> psxMemReset() ENTER <<<\n");
+	xlog("QPSX_232_TEST: psxM=0x%08X (fixed=%d)\n", (u32)psxM, psxM_is_fixed_addr ? 1 : 0);
 #endif
 
 #ifndef SF2000
@@ -270,7 +420,21 @@ void psxMemReset()
 
 void psxMemShutdown()
 {
-	if (psxM_allocated) { free(psxM);  psxM = NULL;  psxM_allocated = false; }
+	/* QPSX_232_TEST: Don't free() psxM if it's a fixed address! */
+	if (psxM_allocated) {
+		if (psxM_is_fixed_addr) {
+#ifdef SF2000
+			xlog("QPSX_232_TEST: psxM is fixed addr, skipping free()\n");
+#endif
+			psxM = NULL;
+			psxM_allocated = false;
+			psxM_is_fixed_addr = false;
+		} else {
+			free(psxM);
+			psxM = NULL;
+			psxM_allocated = false;
+		}
+	}
 	if (psxP_allocated) { free(psxP);  psxP = NULL;  psxP_allocated = false; }
 	if (psxH_allocated) { free(psxH);  psxH = NULL;  psxH_allocated = false; }
 	if (psxR_allocated) { free(psxR);  psxR = NULL;  psxR_allocated = false; }
@@ -282,8 +446,17 @@ void psxMemShutdown()
 	memstats_print();
 }
 
+/* v102: psxMemRead8 with multi-level ASM support */
 u8 psxMemRead8(u32 mem)
 {
+#if defined(SF2000) || defined(__mips__)
+	/* Level 2 = Full psxmem_asm.S */
+	if (g_opt_asm_memwrite == 2) {
+		return psxMemRead8_asm(mem);
+	}
+	/* Level 1 = Same as C (no ASM read optimization in v98) */
+#endif
+
 	memstats_add_read(mem, MEMSTAT_WIDTH_8);
 	u8 ret;
 	u32 t = mem >> 16;
@@ -306,8 +479,17 @@ u8 psxMemRead8(u32 mem)
 	return ret;
 }
 
+/* v102: psxMemRead16 with multi-level ASM support */
 u16 psxMemRead16(u32 mem)
 {
+#if defined(SF2000) || defined(__mips__)
+	/* Level 2 = Full psxmem_asm.S */
+	if (g_opt_asm_memwrite == 2) {
+		return psxMemRead16_asm(mem);
+	}
+	/* Level 1 = Same as C (no ASM read optimization in v98) */
+#endif
+
 	memstats_add_read(mem, MEMSTAT_WIDTH_16);
 	u16 ret;
 	u32 t = mem >> 16;
@@ -330,8 +512,18 @@ u16 psxMemRead16(u32 mem)
 	return ret;
 }
 
+/* v102: psxMemRead32 with multi-level ASM support */
 u32 psxMemRead32(u32 mem)
 {
+#if defined(SF2000) || defined(__mips__)
+	/* Level 2 = Full psxmem_asm.S */
+	if (g_opt_asm_memwrite == 2) {
+		return psxMemRead32_asm(mem);
+	}
+	/* Level 1 = Same as C (no ASM read optimization in v98) */
+#endif
+
+	PROFILE_START(PROF_CPU_MEM_READ);
 	memstats_add_read(mem, MEMSTAT_WIDTH_32);
 	u32 ret;
 	u32 t = mem >> 16;
@@ -351,11 +543,54 @@ u32 psxMemRead32(u32 mem)
 		}
 	}
 
+	PROFILE_END(PROF_CPU_MEM_READ);
 	return ret;
 }
 
+/* v102: psxMemWrite8 with multi-level ASM support */
 void psxMemWrite8(u32 mem, u8 value)
 {
+#if defined(SF2000) || defined(__mips__)
+	/* Level 2 = Full psxmem_asm.S */
+	if (g_opt_asm_memwrite == 2) {
+		psxMemWrite8_asm(mem, value);
+		return;
+	}
+
+	/* Level 1 = v98-style inline ASM (store only) */
+	if (g_opt_asm_memwrite == 1) {
+		u32 t = mem >> 16;
+		u32 m = mem & 0xffff;
+
+		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
+			if (m < 0x400)
+				psxHu8(mem) = value;
+			else
+				psxHwWrite8(mem, value);
+			return;
+		}
+
+		u8 *p = (u8*)(psxMemWLUT[t]);
+		if (p != NULL) {
+			/* Inline ASM store only */
+			__asm__ volatile(
+				"addu $t0, %0, %1\n\t"
+				"sb   %2, 0($t0)\n\t"
+				:
+				: "r"(p), "r"(m), "r"(value)
+				: "$t0", "memory"
+			);
+#ifdef PSXREC
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear((mem & (~3)), 1);
+			}
+#endif
+		}
+		return;
+	}
+#endif
+
+	/* Level 0 = Pure C */
 	memstats_add_write(mem, MEMSTAT_WIDTH_8);
 	u32 t = mem >> 16;
 	u32 m = mem & 0xffff;
@@ -369,7 +604,10 @@ void psxMemWrite8(u32 mem, u8 value)
 		if (p != NULL) {
 			*(u8*)(p + m) = value;
 #ifdef PSXREC
-			psxCpu->Clear((mem & (~3)), 1);
+			/* v098: Skip code invalidation if option enabled (RISK!) */
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear((mem & (~3)), 1);
+			}
 #endif
 		} else {
 			PSXMEM_LOG("%s(): err sb 0x%08x\n", __func__, mem);
@@ -377,8 +615,50 @@ void psxMemWrite8(u32 mem, u8 value)
 	}
 }
 
+/* v102: psxMemWrite16 with multi-level ASM support */
 void psxMemWrite16(u32 mem, u16 value)
 {
+#if defined(SF2000) || defined(__mips__)
+	/* Level 2 = Full psxmem_asm.S */
+	if (g_opt_asm_memwrite == 2) {
+		psxMemWrite16_asm(mem, value);
+		return;
+	}
+
+	/* Level 1 = v98-style inline ASM (store only) */
+	if (g_opt_asm_memwrite == 1) {
+		u32 t = mem >> 16;
+		u32 m = mem & 0xffff;
+
+		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
+			if (m < 0x400)
+				psxHu16ref(mem) = SWAPu16(value);
+			else
+				psxHwWrite16(mem, value);
+			return;
+		}
+
+		u8 *p = (u8*)(psxMemWLUT[t]);
+		if (p != NULL) {
+			/* Inline ASM store only */
+			__asm__ volatile(
+				"addu $t0, %0, %1\n\t"
+				"sh   %2, 0($t0)\n\t"
+				:
+				: "r"(p), "r"(m), "r"(value)
+				: "$t0", "memory"
+			);
+#ifdef PSXREC
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear((mem & (~3)), 1);
+			}
+#endif
+		}
+		return;
+	}
+#endif
+
+	/* Level 0 = Pure C */
 	memstats_add_write(mem, MEMSTAT_WIDTH_16);
 	u32 t = mem >> 16;
 	u32 m = mem & 0xffff;
@@ -392,7 +672,10 @@ void psxMemWrite16(u32 mem, u16 value)
 		if (p != NULL) {
 			*(u16*)(p + m) = SWAPu16(value);
 #ifdef PSXREC
-			psxCpu->Clear((mem & (~3)), 1);
+			/* v098: Skip code invalidation if option enabled (RISK!) */
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear((mem & (~3)), 1);
+			}
 #endif
 		} else {
 			PSXMEM_LOG("%s(): err sh 0x%08x\n", __func__, mem);
@@ -400,8 +683,295 @@ void psxMemWrite16(u32 mem, u16 value)
 	}
 }
 
+/*
+ * v103: psxMemWrite32 with 7-LEVEL ASM support for precise debugging
+ *
+ * Each level adds more ASM operations. Test incrementally to find the bug!
+ *
+ * Level 0 (OFF):      Pure C path (baseline)
+ * Level 1 (V98):      ASM(ptr_arith + store), C(addr_calc, HW, LUT, codeinv) - WORKS!
+ * Level 2 (+ADDR):    ASM(addr_calc + ptr_arith + store), C(HW, LUT, codeinv)
+ * Level 3 (+LUT):     ASM(addr_calc + LUT + ptr_arith + store), C(HW, codeinv)
+ * Level 4 (+HWBR):    ASM(addr_calc + LUT + HW_branch + ptr_arith + store), C(HW_call, codeinv)
+ * Level 5 (+HWCALL):  ASM(everything except codeinv), C(codeinv only)
+ * Level 6 (FULL):     Full psxmem_asm.S (everything in ASM) - BROKEN!
+ */
 void psxMemWrite32(u32 mem, u32 value)
 {
+#if defined(SF2000) || defined(__mips__)
+
+	/* ========== LEVEL 6: FULL psxmem_asm.S ========== */
+	if (g_opt_asm_memwrite == 6) {
+		psxMemWrite32_asm(mem, value);
+		return;
+	}
+
+	/* ========== LEVEL 5: +HWCALL (everything except codeinv in ASM) ========== */
+	if (g_opt_asm_memwrite == 5) {
+		u32 t, m;
+		u8 *p;
+		int did_write = 0;
+
+		/*
+		 * v104 FIX: Split address calculation into separate asm blocks!
+		 * Then pass t and m as INPUTS (not outputs) to the main block.
+		 * This avoids the "two outputs same register" GCC bug.
+		 */
+		__asm__ volatile("srl %0, %1, 16" : "=r"(t) : "r"(mem));
+		__asm__ volatile("andi %0, %1, 0xffff" : "=r"(m) : "r"(mem));
+
+		__asm__ volatile(
+			/* HW detection: check t == 0x1f80 || t == 0x9f80 || t == 0xbf80 */
+			"andi $t1, %2, 0x1fff\n\t"   /* t1 = t & 0x1fff (mask to 0x1f80) */
+			"li   $t2, 0x1f80\n\t"
+			"beq  $t1, $t2, 1f\n\t"      /* if HW region, skip to label 1 */
+			"nop\n\t"
+
+			/* LUT lookup */
+			"la   $t0, psxMemWLUT\n\t"
+			"sll  $t1, %2, 2\n\t"        /* t1 = t * 4 */
+			"addu $t0, $t0, $t1\n\t"
+			"lw   %0, 0($t0)\n\t"        /* p = psxMemWLUT[t] */
+			"beqz %0, 1f\n\t"            /* if p == NULL, skip */
+			"nop\n\t"
+
+			/* Store */
+			"addu $t0, %0, %3\n\t"       /* t0 = p + m */
+			"sw   %4, 0($t0)\n\t"        /* store value */
+			"li   %1, 1\n\t"             /* did_write = 1 */
+			"b    2f\n\t"
+			"nop\n\t"
+
+			"1:\n\t"                     /* HW path - handled in C */
+			"li   %1, 0\n\t"
+			"2:\n\t"
+			: "=&r"(p), "=&r"(did_write)           /* only 2 outputs */
+			: "r"(t), "r"(m), "r"(value)           /* t, m are now inputs */
+			: "$t0", "$t1", "$t2", "memory"
+		);
+
+		if (!did_write) {
+			/* HW registers - handle in C */
+			if ((t & 0x1fff) == 0x1f80) {
+				if (m < 0x400)
+					psxHu32ref(mem) = SWAPu32(value);
+				else
+					psxHwWrite32(mem, value);
+			} else if (mem == 0xfffe0130) {
+				psxMemWrite32_CacheCtrlPort(value);
+			}
+			return;
+		}
+
+#ifdef PSXREC
+		/* Code invalidation in C */
+		if (!g_opt_skip_code_inv) {
+			psxCpu->Clear(mem, 1);
+		}
+#endif
+		return;
+	}
+
+	/* ========== LEVEL 4: +HWBR (HW branch detection in ASM, calls in C) ========== */
+	if (g_opt_asm_memwrite == 4) {
+		u32 t, m;
+		u8 *p;
+		int is_hw = 0;
+
+		/*
+		 * v104 FIX: Split address calculation into separate asm blocks!
+		 * Then pass t and m as INPUTS (not outputs) to the main block.
+		 * This avoids the "two outputs same register" GCC bug.
+		 */
+		__asm__ volatile("srl %0, %1, 16" : "=r"(t) : "r"(mem));
+		__asm__ volatile("andi %0, %1, 0xffff" : "=r"(m) : "r"(mem));
+
+		__asm__ volatile(
+			/* HW detection branch - t is input %2 */
+			"andi $t1, %2, 0x1fff\n\t"   /* t1 = t & 0x1fff */
+			"li   $t2, 0x1f80\n\t"
+			"beq  $t1, $t2, 1f\n\t"      /* if HW, branch to label 1 */
+			"nop\n\t"
+
+			/* LUT lookup */
+			"la   $t0, psxMemWLUT\n\t"
+			"sll  $t1, %2, 2\n\t"        /* t1 = t * 4 */
+			"addu $t0, $t0, $t1\n\t"
+			"lw   %0, 0($t0)\n\t"        /* p = psxMemWLUT[t] */
+			"beqz %0, 2f\n\t"            /* if NULL, skip store */
+			"nop\n\t"
+
+			/* Store */
+			"addu $t0, %0, %3\n\t"       /* t0 = p + m */
+			"sw   %4, 0($t0)\n\t"
+			"li   %1, 0\n\t"             /* is_hw = 0 */
+			"b    2f\n\t"
+			"nop\n\t"
+
+			"1:\n\t"                     /* HW path */
+			"li   %1, 1\n\t"             /* is_hw = 1 */
+			"2:\n\t"
+			: "=&r"(p), "=&r"(is_hw)               /* only 2 outputs */
+			: "r"(t), "r"(m), "r"(value)           /* t, m are now inputs */
+			: "$t0", "$t1", "$t2", "memory"
+		);
+
+		if (is_hw) {
+			/* HW calls in C */
+			if (m < 0x400)
+				psxHu32ref(mem) = SWAPu32(value);
+			else
+				psxHwWrite32(mem, value);
+			return;
+		}
+
+		if (p == NULL) {
+			if (mem == 0xfffe0130) {
+				psxMemWrite32_CacheCtrlPort(value);
+			}
+			return;
+		}
+
+#ifdef PSXREC
+		if (!g_opt_skip_code_inv) {
+			psxCpu->Clear(mem, 1);
+		}
+#endif
+		return;
+	}
+
+	/* ========== LEVEL 3: +LUT (LUT lookup in ASM) ========== */
+	if (g_opt_asm_memwrite == 3) {
+		u32 t = mem >> 16;
+		u32 m = mem & 0xffff;
+
+		/* HW check in C */
+		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
+			if (m < 0x400)
+				psxHu32ref(mem) = SWAPu32(value);
+			else
+				psxHwWrite32(mem, value);
+			return;
+		}
+
+		u8 *p;
+		__asm__ volatile(
+			/* LUT lookup in ASM */
+			"la   $t0, psxMemWLUT\n\t"
+			"sll  $t1, %1, 2\n\t"        /* t1 = t * 4 */
+			"addu $t0, $t0, $t1\n\t"
+			"lw   %0, 0($t0)\n\t"        /* p = psxMemWLUT[t] */
+			: "=&r"(p)
+			: "r"(t)
+			: "$t0", "$t1"
+		);
+
+		if (p != NULL) {
+			/* Store in ASM */
+			__asm__ volatile(
+				"addu $t0, %0, %1\n\t"
+				"sw   %2, 0($t0)\n\t"
+				:
+				: "r"(p), "r"(m), "r"(value)
+				: "$t0", "memory"
+			);
+#ifdef PSXREC
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear(mem, 1);
+			}
+#endif
+		} else if (mem == 0xfffe0130) {
+			psxMemWrite32_CacheCtrlPort(value);
+		}
+		return;
+	}
+
+	/* ========== LEVEL 2: +ADDR (address calc in ASM) ========== */
+	if (g_opt_asm_memwrite == 2) {
+		u32 t, m;
+
+		/*
+		 * v104 FIX: Split into SEPARATE asm blocks!
+		 *
+		 * The bug was: "=&r" only prevents overlap with INPUTS, not other OUTPUTS.
+		 * GCC could allocate same register for t and m, causing corruption.
+		 *
+		 * Fix: One instruction per asm block guarantees distinct registers
+		 * because both t and m are live after both asm blocks.
+		 */
+		__asm__ volatile("srl %0, %1, 16" : "=r"(t) : "r"(mem));
+		__asm__ volatile("andi %0, %1, 0xffff" : "=r"(m) : "r"(mem));
+
+		/* HW check in C */
+		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
+			if (m < 0x400)
+				psxHu32ref(mem) = SWAPu32(value);
+			else
+				psxHwWrite32(mem, value);
+			return;
+		}
+
+		/* LUT lookup in C */
+		u8 *p = (u8*)(psxMemWLUT[t]);
+		if (p != NULL) {
+			/* Store in ASM */
+			__asm__ volatile(
+				"addu $t0, %0, %1\n\t"
+				"sw   %2, 0($t0)\n\t"
+				:
+				: "r"(p), "r"(m), "r"(value)
+				: "$t0", "memory"
+			);
+#ifdef PSXREC
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear(mem, 1);
+			}
+#endif
+		} else if (mem == 0xfffe0130) {
+			psxMemWrite32_CacheCtrlPort(value);
+		}
+		return;
+	}
+
+	/* ========== LEVEL 1: V98 (ptr_arith + store only in ASM) ========== */
+	if (g_opt_asm_memwrite == 1) {
+		u32 t = mem >> 16;
+		u32 m = mem & 0xffff;
+
+		/* HW check in C */
+		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
+			if (m < 0x400)
+				psxHu32ref(mem) = SWAPu32(value);
+			else
+				psxHwWrite32(mem, value);
+			return;
+		}
+
+		/* LUT lookup in C */
+		u8 *p = (u8*)(psxMemWLUT[t]);
+		if (p != NULL) {
+			/* Only ptr_arith + store in ASM - this is v98! */
+			__asm__ volatile(
+				"addu $t0, %0, %1\n\t"   /* t0 = p + m */
+				"sw   %2, 0($t0)\n\t"    /* store value */
+				:
+				: "r"(p), "r"(m), "r"(value)
+				: "$t0", "memory"
+			);
+#ifdef PSXREC
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear(mem, 1);
+			}
+#endif
+		} else if (mem == 0xfffe0130) {
+			psxMemWrite32_CacheCtrlPort(value);
+		}
+		return;
+	}
+#endif
+
+	/* ========== LEVEL 0: OFF (Pure C) ========== */
+	PROFILE_START(PROF_CPU_MEM_WRITE);
 	memstats_add_write(mem, MEMSTAT_WIDTH_32);
 	u32 t = mem >> 16;
 	u32 m = mem & 0xffff;
@@ -415,7 +985,10 @@ void psxMemWrite32(u32 mem, u32 value)
 		if (p != NULL) {
 			*(u32*)(p + m) = SWAPu32(value);
 #ifdef PSXREC
-			psxCpu->Clear(mem, 1);
+			/* v098: Skip code invalidation if option enabled (RISK!) */
+			if (!g_opt_skip_code_inv) {
+				psxCpu->Clear(mem, 1);
+			}
 #endif
 		} else {
 			if (mem != 0xfffe0130) {
@@ -429,6 +1002,7 @@ void psxMemWrite32(u32 mem, u32 value)
 			}
 		}
 	}
+	PROFILE_END(PROF_CPU_MEM_WRITE);
 }
 
 // Write to cache control port 0xfffe0130

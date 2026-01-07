@@ -24,6 +24,26 @@
  */
 extern int g_opt_const_prop;
 
+/*
+ * QPSX_114/115: Native Mode - MIPS I to MIPS32 direct execution
+ *
+ * Since MIPS I and MIPS32 are binary compatible for ALU/shift/imm instructions,
+ * we can skip some overhead in FAST mode:
+ *   - Skip extended const prop checks (algebraic identities)
+ *   - Just emit the instruction with minimal overhead
+ *
+ * v115 adds SEMI mode inspired by Sony POPS (PSP PS1 emulator):
+ *   - POPS runs PSX code "semi-natively" on PSP's compatible MIPS CPU
+ *   - Uses "code analyzer" to identify what can run directly vs needs handling
+ *   - SEMI mode tracks "pure ALU blocks" that could run almost directly
+ *
+ * 0 = OFF (normal dynarec path)
+ * 1 = STATS (count native-capable vs emulated instructions)
+ * 2 = FAST (skip extended const prop for simple ALU - reduces overhead)
+ * 3 = SEMI (POPS-style: skip ALL const prop for ALU, tracks pure blocks)
+ */
+extern int g_opt_native_mode;
+
 /***********************************************
  * Options that can be disabled for debugging: *
  ***********************************************/
@@ -230,6 +250,29 @@ static void recADDU()
 	const bool rs_const = IsConst(_Rs_);
 	const bool rt_const = IsConst(_Rt_);
 
+	/* v114: FAST mode - skip extended const prop for simpler codegen
+	 * The instruction is binary-compatible, just emit it directly
+	 * with minimal register management overhead.
+	 *
+	 * v115: SEMI mode - skip ALL const prop, absolute minimum overhead
+	 * POPS-inspired: treat these as near-direct execution candidates
+	 */
+	if (g_opt_native_mode >= 2) {
+		/* FAST/SEMI: skip algebraic identity checks */
+		if (g_opt_native_mode == 3) {
+			/* SEMI: Skip ALL const tracking - near-native path */
+			SetUndef(_Rd_);
+			REC_RTYPE_RD_RS_RT(ADDU, _Rd_, _Rs_, _Rt_);
+		} else {
+			/* FAST: still track consts but skip extended checks */
+			const bool set_const = rs_const && rt_const;
+			REC_RTYPE_RD_RS_RT(ADDU, _Rd_, _Rs_, _Rt_);
+			if (set_const)
+				SetConst(_Rd_, GetConst(_Rs_) + GetConst(_Rt_));
+		}
+		return;
+	}
+
 	// Extended const prop: ADD with 0 → identity
 	if (g_opt_const_prop && (rs_const || rt_const)) {
 		u32 rs_val = rs_const ? GetConst(_Rs_) : 0;
@@ -316,6 +359,21 @@ static void recSUBU()
 	const bool rs_const = IsConst(_Rs_);
 	const bool rt_const = IsConst(_Rt_);
 
+	/* v114/v115: FAST/SEMI mode - skip extended const prop */
+	if (g_opt_native_mode >= 2) {
+		if (g_opt_native_mode == 3) {
+			/* SEMI: Skip ALL const tracking - near-native path */
+			SetUndef(_Rd_);
+			REC_RTYPE_RD_RS_RT(SUBU, _Rd_, _Rs_, _Rt_);
+		} else {
+			const bool set_const = rs_const && rt_const;
+			REC_RTYPE_RD_RS_RT(SUBU, _Rd_, _Rs_, _Rt_);
+			if (set_const)
+				SetConst(_Rd_, GetConst(_Rs_) - GetConst(_Rt_));
+		}
+		return;
+	}
+
 	// Extended const prop: SUB with 0 in rt → identity
 	if (g_opt_const_prop && rt_const) {
 		u32 rt_val = GetConst(_Rt_);
@@ -352,6 +410,21 @@ static void recAND()
 
 	const bool rs_const = IsConst(_Rs_);
 	const bool rt_const = IsConst(_Rt_);
+
+	/* v114/v115: FAST/SEMI mode - skip extended const prop */
+	if (g_opt_native_mode >= 2) {
+		if (g_opt_native_mode == 3) {
+			/* SEMI: Skip ALL const tracking - near-native path */
+			SetUndef(_Rd_);
+			REC_RTYPE_RD_RS_RT(AND, _Rd_, _Rs_, _Rt_);
+		} else {
+			const bool set_const = rs_const && rt_const;
+			REC_RTYPE_RD_RS_RT(AND, _Rd_, _Rs_, _Rt_);
+			if (set_const)
+				SetConst(_Rd_, GetConst(_Rs_) & GetConst(_Rt_));
+		}
+		return;
+	}
 
 	// Extended const prop: algebraic identity optimizations
 	if (g_opt_const_prop && (rs_const || rt_const)) {
@@ -414,6 +487,21 @@ static void recOR()
 	const bool rs_const = IsConst(_Rs_);
 	const bool rt_const = IsConst(_Rt_);
 
+	/* v114/v115: FAST/SEMI mode - skip extended const prop */
+	if (g_opt_native_mode >= 2) {
+		if (g_opt_native_mode == 3) {
+			/* SEMI: Skip ALL const tracking - near-native path */
+			SetUndef(_Rd_);
+			REC_RTYPE_RD_RS_RT(OR, _Rd_, _Rs_, _Rt_);
+		} else {
+			const bool set_const = rs_const && rt_const;
+			REC_RTYPE_RD_RS_RT(OR, _Rd_, _Rs_, _Rt_);
+			if (set_const)
+				SetConst(_Rd_, GetConst(_Rs_) | GetConst(_Rt_));
+		}
+		return;
+	}
+
 	// Extended const prop: algebraic identity optimizations
 	if (g_opt_const_prop && (rs_const || rt_const)) {
 		u32 rs_val = rs_const ? GetConst(_Rs_) : 0;
@@ -474,6 +562,21 @@ static void recXOR()
 
 	const bool rs_const = IsConst(_Rs_);
 	const bool rt_const = IsConst(_Rt_);
+
+	/* v114/v115: FAST/SEMI mode - skip extended const prop */
+	if (g_opt_native_mode >= 2) {
+		if (g_opt_native_mode == 3) {
+			/* SEMI: Skip ALL const tracking - near-native path */
+			SetUndef(_Rd_);
+			REC_RTYPE_RD_RS_RT(XOR, _Rd_, _Rs_, _Rt_);
+		} else {
+			const bool set_const = rs_const && rt_const;
+			REC_RTYPE_RD_RS_RT(XOR, _Rd_, _Rs_, _Rt_);
+			if (set_const)
+				SetConst(_Rd_, GetConst(_Rs_) ^ GetConst(_Rt_));
+		}
+		return;
+	}
 
 	// Extended const prop: algebraic identity optimizations
 	if (g_opt_const_prop && (rs_const || rt_const)) {

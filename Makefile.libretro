@@ -1,5 +1,9 @@
 # PCSX4ALL libretro Makefile for SF2000
 # Based on UAE4ALL libretro Makefile - follow EXACT same patterns!
+# QPSX_111 - MIPS32 ASM CDDA mixer + runtime toggle
+# QPSX_110 - CDDA Runtime Options, Profiler CDDA, DirectBlockLUT fix
+# QPSX_100 - Direct Block LUT: 1-level lookup replaces 2-level psxRecLUT
+# QPSX_099 - Pure ASM memory functions (psxmem_asm.S)
 # QPSX_043 - REAL BIOS: Use scph5501.bin instead of HLE + debug logging
 
 NAME    = pcsx4all
@@ -110,7 +114,8 @@ OBJS = \
 	src/ppf.o \
 	src/sio.o \
 	src/pad.o \
-	src/gte.o
+	src/gte.o \
+	src/profiler.o
 
 # MIPS Recompiler - QPSX_035: Enabled for SF2000 with custom cache flush
 OBJS += \
@@ -125,6 +130,15 @@ OBJS += \
 	src/gpu/gpulib/gpu.o \
 	src/gpu/gpulib/vout_port.o
 
+# QPSX v091: MIPS32 Assembly optimizations (SF2000 only)
+# QPSX v099: Added psxmem_asm.o for memory write optimization
+ifeq ($(platform), sf2000)
+OBJS += \
+	src/gpu/$(GPU)/gpu_inner_mips32.o \
+	src/gte_asm.o \
+	src/psxmem_asm.o
+endif
+
 # SPU - pcsxrearmed with libretro audio backend
 OBJS += \
 	src/spu/$(SPU)/spu.o \
@@ -134,6 +148,12 @@ OBJS += \
 	src/spu/$(SPU)/nullsnd.o \
 	src/spu/$(SPU)/registers.o \
 	src/spu/$(SPU)/libretro.o
+
+# QPSX v111: MIPS32 ASM CDDA mixer (SF2000 only)
+ifeq ($(platform), sf2000)
+OBJS += \
+	src/spu/$(SPU)/cdda_mix_asm.o
+endif
 
 # Plugin lib
 OBJS += \

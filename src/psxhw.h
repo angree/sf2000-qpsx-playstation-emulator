@@ -72,12 +72,23 @@
 }
 
 void psxHwReset(void);
+
+/* v100: extern "C" for ASM linkage (psxmem_asm.S calls these) */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 u8   psxHwRead8 (u32 add);
 u16  psxHwRead16(u32 add);
 u32  psxHwRead32(u32 add);
 void psxHwWrite8 (u32 add, u8  value);
 void psxHwWrite16(u32 add, u16 value);
 void psxHwWrite32(u32 add, u32 value);
+
+#ifdef __cplusplus
+}
+#endif
+
 int psxHwFreeze(void* f, FreezeMode mode);
 
 #endif /* __PSXHW_H__ */

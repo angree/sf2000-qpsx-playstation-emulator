@@ -217,6 +217,12 @@ do { \
 #define SW(rd, rs, imm16) \
 	write32(0xac000000 | ((rs) << 21) | ((rd) << 16) | ((imm16) & 0xffff))
 
+#define SB(rt, rs, imm16) \
+	write32(0xa0000000 | ((rs) << 21) | ((rt) << 16) | ((imm16) & 0xffff))
+
+#define SH(rt, rs, imm16) \
+	write32(0xa4000000 | ((rs) << 21) | ((rt) << 16) | ((imm16) & 0xffff))
+
 #define LWL(rt, rs, imm16) \
 	write32(0x88000000 | ((rs) << 21) | ((rt) << 16) | ((imm16) & 0xffff))
 
@@ -354,6 +360,16 @@ do {                                                                           \
 
 #define JR(rs) \
 	write32(0x00000008 | ((rs) << 21))
+
+/* v224: JALR - Jump And Link Register (no 256MB limitation like JAL!)
+ * JALR rd, rs: jump to address in rs, store return address in rd
+ * Encoding: 000000 | rs | 00000 | rd | 00000 | 001001
+ */
+#define JALR(rd, rs) \
+	write32(0x00000009 | ((rs) << 21) | ((rd) << 11))
+
+/* JALR with implicit $ra as link register */
+#define JALR_RA(rs) JALR(31, rs)
 
 #define J(addr) \
     write32(0x08000000 | (((u32)(addr) & 0x0fffffff) >> 2))

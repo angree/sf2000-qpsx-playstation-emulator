@@ -108,6 +108,8 @@ long CDR_stop(void);
 long CDR_getStatus(struct CdrStat *);
 unsigned char *CDR_getBufferSub(void);
 long CDR_readCDDA(unsigned char m, unsigned char s, unsigned char f, unsigned char *buffer);
+/* v253: Batch CDDA read - reads count consecutive sectors in one I/O operation */
+long CDR_readCDDA_batch(unsigned char m, unsigned char s, unsigned char f, unsigned char *buffer, int count);
 
 // SPU structures
 

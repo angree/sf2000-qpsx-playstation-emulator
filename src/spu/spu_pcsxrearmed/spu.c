@@ -30,6 +30,11 @@
 #include "registers.h"
 #include "out.h"
 #include "spu_config.h"
+#include "profiler.h"   /* v092: Profiler support */
+
+/* v110: CDDA speedup options (runtime) - defined in libretro-core.cpp */
+extern int g_opt_cdda_fast_mix;     /* Skip spu.spuMem writes for SPU Capture */
+extern int g_opt_cdda_unity_vol;    /* Skip volume multiply when vol=100% */
 
 #ifdef __arm__
 #include "arm_features.h"
@@ -1089,6 +1094,8 @@ static const void * const worker = NULL;
 
 void do_samples(unsigned int cycles_to, int do_direct)
 {
+ PROFILE_START(PROF_SPU_TOTAL);
+
  unsigned int silentch;
  int cycle_diff;
  int ns_to;
@@ -1098,6 +1105,7 @@ void do_samples(unsigned int cycles_to, int do_direct)
   {
    //xprintf("desync %u %d\n", cycles_to, cycle_diff);
    spu.cycles_played = cycles_to;
+   PROFILE_END(PROF_SPU_TOTAL);
    return;
   }
 
@@ -1107,8 +1115,10 @@ void do_samples(unsigned int cycles_to, int do_direct)
  if (worker != NULL)
   sync_worker_thread(do_direct);
 
- if (cycle_diff < 2 * 768)
+ if (cycle_diff < 2 * 768) {
+  PROFILE_END(PROF_SPU_TOTAL);
   return;
+ }
 
  ns_to = (cycle_diff / 768 + 1) & ~1;
  if (ns_to > NSSIZE) {
@@ -1164,6 +1174,8 @@ void do_samples(unsigned int cycles_to, int do_direct)
 
   spu.cycles_played += ns_to * 768;
   spu.decode_pos = (spu.decode_pos + ns_to) & 0x1ff;
+
+  PROFILE_END(PROF_SPU_TOTAL);
 }
 
 static void do_samples_finish(int *SSumLR, int ns_to,
@@ -1185,7 +1197,9 @@ static void do_samples_finish(int *SSumLR, int ns_to,
     spu.decode_dirty_ch &= ~(1<<3);
    }
 
+  PROFILE_START(PROF_CDDA);
   MixXA(SSumLR, ns_to, decode_pos);
+  PROFILE_END(PROF_CDDA);
   
   if((spu.spuCtrl&0x4000)==0) // muted? (rare, don't optimize for this)
    {

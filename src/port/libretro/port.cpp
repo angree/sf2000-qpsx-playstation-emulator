@@ -88,8 +88,19 @@ unsigned short pad_read(int num)
 
 void video_flip(void)
 {
-    if (skip_video_output) return;
-    if (video_cb && SCREEN) video_cb(SCREEN, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
+    if (!video_cb) return;
+
+    /*
+     * v108: Proper libretro frame duping
+     * When skip_video_output is set, call video_cb(NULL) to tell frontend
+     * to reuse previous frame. This is faster than sending same data again.
+     * IMPORTANT: We must still call video_cb for profiler timing to work!
+     */
+    if (skip_video_output) {
+        video_cb(NULL, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
+    } else if (SCREEN) {
+        video_cb(SCREEN, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
+    }
 }
 
 void video_clear(void) { memset(SCREEN, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 2); }

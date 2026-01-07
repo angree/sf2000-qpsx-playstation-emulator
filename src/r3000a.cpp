@@ -31,6 +31,7 @@
 #include "mdec.h"
 #include "gte.h"
 #include "psxevents.h"
+#include "profiler.h"  /* v094: Detailed CPU profiling */
 
 extern "C" void xlog(const char *fmt, ...);
 
@@ -115,6 +116,8 @@ void psxShutdown() {
 }
 
 void psxException(u32 code, u32 bd) {
+	PROFILE_START(PROF_CPU_EXCEPTION);
+
 	// Set the Cause, preserving R/W 'interrupt pending field' bits 8,9
 	// (From Notaz's PCSX Rearmed)
 	psxRegs.CP0.n.Cause = (psxRegs.CP0.n.Cause & 0x300) | code;
@@ -143,10 +146,19 @@ void psxException(u32 code, u32 bd) {
 	if (Config.HLE) {
 		psxBiosException();
 	}
+
+	PROFILE_END(PROF_CPU_EXCEPTION);
 }
 
 void psxBranchTest()
 {
+	/* v141 DEBUG: Log psxBranchTest entry to verify it's called */
+	static int branch_entry_count = 0;
+	if (branch_entry_count < 10) {
+		xlog("BRANCH: psxBranchTest entry #%d cycle=%u", branch_entry_count, psxRegs.cycle);
+		branch_entry_count++;
+	}
+
 	//senquack - Do not rearrange the math here! Events' sCycle val can end up
 	// negative (very large unsigned int) when a PSXINT_RESET_CYCLE_VAL event
 	// resets psxRegs.cycle to 0 and subtracts the previous psxRegs.cycle value

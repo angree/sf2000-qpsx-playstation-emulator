@@ -296,9 +296,62 @@ static inline bool BlendingEnabled()
 	return gpu_unai.config.blending;
 }
 
+/*
+ * QPSX_090: Fast Blending - Branchless blending optimization
+ *
+ * When enabled, blending uses branchless MIPS-friendly operations.
+ * Avoids conditional branches in hot pixel loop using arithmetic clamping.
+ *
+ * Speedup: ~5-15% for semi-transparent polygons
+ * Visual impact: None (mathematically identical for most cases)
+ * Controlled via menu: "Fast Blend" option (ON by default for SF2000)
+ */
+static inline bool FastBlendingEnabled()
+{
+	return gpu_unai.config.fast_blending;
+}
+
 static inline bool DitheringEnabled()
 {
 	return gpu_unai.config.dithering;
+}
+
+/*
+ * QPSX_091: MIPS32 Assembly Optimizations
+ *
+ * When enabled, GPU uses hand-written MIPS32 assembly functions with:
+ * - MOVN/MOVZ: Branchless clamping (no pipeline stalls)
+ * - EXT/INS: Efficient RGB565 bit field manipulation
+ * - Optimized instruction scheduling to hide load-use latency
+ *
+ * Speedup: ~10-15% for lit/blended polygons
+ * Requires: MIPS32 Release 2 (SF2000 has this)
+ */
+static inline bool AsmLightingEnabled()
+{
+#if defined(SF2000) || defined(__mips__)
+	return gpu_unai.config.asm_lighting;
+#else
+	return false;  // Not available on non-MIPS
+#endif
+}
+
+static inline bool AsmBlendingEnabled()
+{
+#if defined(SF2000) || defined(__mips__)
+	return gpu_unai.config.asm_blending;
+#else
+	return false;
+#endif
+}
+
+static inline bool PrefetchEnabled()
+{
+#if defined(SF2000) || defined(__mips__)
+	return gpu_unai.config.prefetch_tex;
+#else
+	return false;
+#endif
 }
 
 // For now, this is just for development/experimentation purposes..

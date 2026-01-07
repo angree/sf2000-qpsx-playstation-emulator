@@ -4,6 +4,7 @@
 #include "rec_mdu.cpp.h" // Multiple Divide Unit
 #include "rec_cp0.cpp.h" // Coprocessor 0
 #include "rec_bcu.cpp.h" // Branch Control Unit
+#include "rec_native.cpp.h" // v118: Native block translator
 
 static void recNULL() { }
 

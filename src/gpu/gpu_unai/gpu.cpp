@@ -25,6 +25,14 @@
 #include "port.h"
 #include "gpu_unai.h"
 
+/*
+ * QPSX v089: Fast Lighting - use multiply+shift instead of LUT
+ * Enabled by default for SF2000 - faster but slightly different brightness
+ */
+#if defined(SF2000) || defined(__mips__)
+#define GPU_UNAI_USE_FAST_LIGHTING
+#endif
+
 #define GPU_INLINE static inline __attribute__((always_inline))
 
 #define VIDEO_WIDTH 320

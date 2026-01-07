@@ -36,16 +36,31 @@
 // NOTE: Also see options 'USE_CONST_ADDRESSES' and 'USE_CONST_FUZZY_ADDRESSES'
 //       defined elsewhere.
 
+/*
+ * v116: SEMI mode aggressive optimizations (g_opt_native_mode == 3)
+ *
+ * In SEMI mode, we make aggressive assumptions to reduce emitted code:
+ * - Skip code invalidation for ALL stores (not just some base regs)
+ * - Skip address range checks for ALL base regs (assume RAM access)
+ * - Use direct memory paths whenever possible
+ *
+ * This is DANGEROUS but can significantly reduce overhead for games
+ * that don't use self-modifying code or unusual memory access patterns.
+ */
+extern int g_opt_native_mode;
+
 // Inline access to known-const HW,Scratchpad addresses (see rec_lsu_hw.cpp.h)
 #define USE_DIRECT_HW_ACCESS
 
 // Assume that stores using $k0,$k1,$gp,$sp as base registers aren't used
 //  to modify code. Code invalidation sequence will not be emitted.
+// v116: In SEMI mode, skip for ALL base registers
 #define SKIP_CODE_INVALIDATION_FOR_SOME_BASE_REGS
 
 // Assume that loads/stores using $zero,$k0,$k1,$gp,$sp as base registers always
 //  go to RAM/scratchpad. Address-range-check and indirect-access sequences
 //  will not be emitted.
+// v116: In SEMI mode, skip for ALL base registers
 #define SKIP_ADDRESS_RANGE_CHECK_FOR_SOME_BASE_REGS
 
 // Allow series of loads/stores to extend into a branch delay slot.
@@ -289,6 +304,12 @@ static inline bool LSU_skip_code_invalidation(const u32 op_rs)
 	if (!emit_code_invalidations)
 		return true;
 
+	/* v116: SEMI mode - skip ALL code invalidation
+	 * Assumes game doesn't use self-modifying code (dangerous but fast)
+	 */
+	if (g_opt_native_mode == 3)
+		return true;
+
 #ifdef SKIP_CODE_INVALIDATION_FOR_SOME_BASE_REGS
 	// Skip code invalidation when base reg is obviously not
 	//  involved in code modification ($k0,$k1,$gp,$sp).
@@ -312,6 +333,12 @@ static inline bool LSU_use_only_direct_access(const u32 op_rs)
 {
 	// NOTE: If 'psx_mem_mapped' is true, all valid PS1 addresses between begin
 	//       of RAM and end of scratchpad are virtually mapped/mirrored.
+
+	/* v116: SEMI mode - assume ALL accesses go to RAM/scratchpad
+	 * This skips address range checks and indirect access paths (dangerous but fast)
+	 */
+	if (g_opt_native_mode == 3 && psx_mem_mapped)
+		return true;
 
 #ifdef SKIP_ADDRESS_RANGE_CHECK_FOR_SOME_BASE_REGS
 	if (psx_mem_mapped) {

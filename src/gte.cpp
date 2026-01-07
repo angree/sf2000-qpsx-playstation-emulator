@@ -21,6 +21,7 @@
 
 #include "gte.h"
 #include "psxmem.h"
+#include "profiler.h"
 
 // MIPS platforms have hardware divider, faster than 64KB LUT + UNR algo
 #if defined(__mips__)
@@ -54,6 +55,21 @@ extern int g_opt_rtpt_unroll;
  */
 extern int g_opt_gte_unrdiv;   /* UNR division (default: OFF) */
 extern int g_opt_gte_noflags;  /* Skip overflow flags (default: OFF) - RISK! */
+
+/*
+ * QPSX v095: Hand-written MIPS32 assembly GTE functions
+ * These are optional replacements for C++ versions.
+ * Enable via menu options (off by default).
+ */
+extern int g_opt_asm_block1;   /* ASM Block 1: NCLIP (default: OFF) */
+extern int g_opt_asm_block2;   /* ASM Block 2: AVSZ3 (default: OFF) */
+
+#if defined(SF2000) || defined(__mips__)
+extern "C" {
+    void gte_NCLIP_asm(void);
+    void gte_AVSZ3_asm(void);
+}
+#endif
 
 // (This is a backported optimization from PCSX Rearmed -senquack)
 // On slower platforms, bounds-check is disabled on some calculations,
@@ -517,6 +533,7 @@ void gteSWC2(void) {
 }
 
 void gteRTPS(void) {
+	PROFILE_START(PROF_GTE_RTPS);
 	int quotient;
 
 #ifdef GTE_LOG
@@ -547,6 +564,7 @@ void gteRTPS(void) {
 	s64 tmp = (s64)gteDQB + ((s64)gteDQA * quotient);
 	gteMAC0 = F(tmp);
 	gteIR0 = limH(tmp >> 12);
+	PROFILE_END(PROF_GTE_RTPS);
 }
 
 /*
@@ -680,6 +698,7 @@ static void gteRTPT_loop(void) {
 
 /* Public RTPT - dispatches to fast or loop version based on config */
 void gteRTPT(void) {
+	PROFILE_START(PROF_GTE_RTPT);
 #ifdef GTE_LOG
 	GTE_LOG("GTE RTPT\n");
 #endif
@@ -687,14 +706,17 @@ void gteRTPT(void) {
 #ifdef GTE_USE_FAST_RTPT
 	if (g_opt_rtpt_unroll) {
 		gteRTPT_fast();
+		PROFILE_END(PROF_GTE_RTPT);
 		return;
 	}
 #endif
 	gteRTPT_loop();
+	PROFILE_END(PROF_GTE_RTPT);
 }
 
 // NOTE: 'gteop' parameter is instruction opcode shifted right 10 places.
 void gteMVMVA(u32 gteop) {
+	PROFILE_START(PROF_GTE_MVMVA);
 	int shift = 12 * GTE_SF(gteop);
 	int mx = GTE_MX(gteop);
 	int v = GTE_V(gteop);
@@ -716,23 +738,45 @@ void gteMVMVA(u32 gteop) {
 	gteIR1 = limB1(gteMAC1, lm);
 	gteIR2 = limB2(gteMAC2, lm);
 	gteIR3 = limB3(gteMAC3, lm);
+	PROFILE_END(PROF_GTE_MVMVA);
 }
 
 void gteNCLIP(void) {
+	PROFILE_START(PROF_GTE_NCLIP);
 #ifdef GTE_LOG
 	GTE_LOG("GTE NCLIP\n");
 #endif
+
+#if defined(SF2000) || defined(__mips__)
+	/* QPSX v095: Use hand-written ASM if enabled */
+	if (g_opt_asm_block1) {
+		gte_NCLIP_asm();
+		PROFILE_END(PROF_GTE_NCLIP);
+		return;
+	}
+#endif
+
 	gteFLAG = 0;
 
 	gteMAC0 = F((s64)gteSX0 * (gteSY1 - gteSY2) +
 				gteSX1 * (gteSY2 - gteSY0) +
 				gteSX2 * (gteSY0 - gteSY1));
+	PROFILE_END(PROF_GTE_NCLIP);
 }
 
 void gteAVSZ3(void) {
 #ifdef GTE_LOG
 	GTE_LOG("GTE AVSZ3\n");
 #endif
+
+#if defined(SF2000) || defined(__mips__)
+	/* QPSX v095: Use hand-written ASM if enabled */
+	if (g_opt_asm_block2) {
+		gte_AVSZ3_asm();
+		return;
+	}
+#endif
+
 	gteFLAG = 0;
 
 	gteMAC0 = F((s64)gteZSF3 * (gteSZ1 + gteSZ2 + gteSZ3));

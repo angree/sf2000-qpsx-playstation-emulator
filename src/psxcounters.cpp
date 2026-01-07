@@ -41,6 +41,9 @@
 #include "psxevents.h"
 #include "gpu.h"
 
+/* v140 DEBUG: xlog for debug logging */
+extern "C" void xlog(const char *fmt, ...);
+
 /******************************************************************************/
 
 enum
@@ -358,6 +361,15 @@ void psxRcntUpdate()
             // Do framelimit, frameskip, perf stats, controls, etc:
             // NOTE: this is point of control transfer to frontend menu
             EmuUpdate();
+
+            /* v140 DEBUG: Log after EmuUpdate returns */
+            {
+                static int emu_return_count = 0;
+                if (emu_return_count < 10) {
+                    xlog("RCNT: EmuUpdate returned #%d, cycle=%u", emu_return_count, cycle);
+                    emu_return_count++;
+                }
+            }
 
             // If frontend called LoadState(), loading a savestate, do not
             //  proceed further: Rootcounter state has been altered.

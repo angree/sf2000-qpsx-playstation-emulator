@@ -51,11 +51,18 @@
 #include "gpu_inner_quantization.h"
 #include "gpu_inner_light.h"
 
+// QPSX v091: MIPS32 Assembly optimizations
+#include "gpu_inner_mips32.h"
+
 // If defined, Gouraud colors are fixed-point 5.11, otherwise they are 8.16
 // This is only for debugging/verification of low-precision colors in C.
 // Low-precision Gouraud is intended for use by SIMD-optimized inner drivers
 // which get/use Gouraud colors in SIMD registers.
-//#define GPU_GOURAUD_LOW_PRECISION
+//
+// QPSX v089: Enable for SF2000 - fewer bits = faster math, minor visual difference
+#if defined(SF2000) || defined(__mips__)
+#define GPU_GOURAUD_LOW_PRECISION
+#endif
 
 // How many bits of fixed-point precision GouraudColor uses
 #ifdef GPU_GOURAUD_LOW_PRECISION
@@ -142,8 +149,13 @@ static u8* gpuPixelSpanFn(u8* pDst, uintptr_t data, ptrdiff_t incr, size_t len)
 
 				u16 uSrc = col;
 
-				if (CF_BLEND)
-					uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				if (CF_BLEND) {
+					// QPSX_090: Use fast blending if enabled
+					if (FastBlendingEnabled())
+						uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+					else
+						uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				}
 
 				if (CF_MASKSET) { *(u16*)pDst = uSrc | 0x8000; }
 				else            { *(u16*)pDst = uSrc;          }
@@ -173,8 +185,13 @@ static u8* gpuPixelSpanFn(u8* pDst, uintptr_t data, ptrdiff_t incr, size_t len)
 				//  unset. For untextured prims, this is always true.
 				const bool skip_uSrc_mask = true;
 
-				if (CF_BLEND)
-					uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				if (CF_BLEND) {
+					// QPSX_090: Use fast blending if enabled
+					if (FastBlendingEnabled())
+						uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+					else
+						uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				}
 
 				if (CF_MASKSET) { *(u16*)pDst = uSrc | 0x8000; }
 				else            { *(u16*)pDst = uSrc;          }
@@ -263,7 +280,15 @@ static void gpuTileSpanFn(u16 *pDst, u32 count, u16 data)
 {
 	if (!CF_MASKCHECK && !CF_BLEND) {
 		if (CF_MASKSET) { data = data | 0x8000; }
-		do { *pDst++ = data; } while (--count);
+		// QPSX v089: 8x loop unroll for tile fills - significant speedup
+		while (count >= 8) {
+			pDst[0] = data; pDst[1] = data;
+			pDst[2] = data; pDst[3] = data;
+			pDst[4] = data; pDst[5] = data;
+			pDst[6] = data; pDst[7] = data;
+			pDst += 8; count -= 8;
+		}
+		while (count--) { *pDst++ = data; }
 	} else if (CF_MASKCHECK && !CF_BLEND) {
 		if (CF_MASKSET) { data = data | 0x8000; }
 		do { if (!(*pDst&0x8000)) { *pDst = data; } pDst++; } while (--count);
@@ -281,8 +306,13 @@ static void gpuTileSpanFn(u16 *pDst, u32 count, u16 data)
 
 			uSrc = data;
 
-			if (CF_BLEND)
-				uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+			if (CF_BLEND) {
+				// QPSX_090: Use fast blending if enabled
+				if (FastBlendingEnabled())
+					uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+				else
+					uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+			}
 
 			if (CF_MASKSET) { *pDst = uSrc | 0x8000; }
 			else            { *pDst = uSrc;          }
@@ -379,15 +409,24 @@ static void gpuSpriteSpanFn(u16 *pDst, u32 count, u8* pTxt, u32 u0)
 		if (CF_BLEND || CF_LIGHT) srcMSB = uSrc & 0x8000;
 		
 		if (CF_LIGHT) {
-			// QPSX_081: Use fast lighting if enabled
-			if (FastLightingEnabled())
+			// QPSX_091: Priority: ASM > Fast > LUT
+			if (AsmLightingEnabled())
+				uSrc = gpuLightingTXT_ASM(uSrc, r5, g5, b5);
+			else if (FastLightingEnabled())
 				uSrc = gpuLightingTXT_Fast(uSrc, r5, g5, b5);
 			else
 				uSrc = gpuLightingTXT(uSrc, r5, g5, b5);
 		}
 
-		if (CF_BLEND && srcMSB)
-			uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+		if (CF_BLEND && srcMSB) {
+			// QPSX_091: Priority: ASM > Fast > Original
+			if (AsmBlendingEnabled())
+				uSrc = gpuBlending_ASM<CF_BLENDMODE>(uSrc, uDst);
+			else if (FastBlendingEnabled())
+				uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+			else
+				uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+		}
 
 		if (CF_MASKSET)                { *pDst = uSrc | 0x8000; }
 		else if (CF_BLEND || CF_LIGHT) { *pDst = uSrc | srcMSB; }
@@ -492,8 +531,13 @@ static void gpuPolySpanFn(const gpu_unai_t &gpu_unai, u16 *pDst, u32 count)
 
 				uSrc = pix15;
 
-				if (CF_BLEND)
-					uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				if (CF_BLEND) {
+					// QPSX_090: Use fast blending if enabled
+					if (FastBlendingEnabled())
+						uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+					else
+						uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				}
 
 				if (CF_MASKSET) { *pDst = uSrc | 0x8000; }
 				else            { *pDst = uSrc;          }
@@ -521,16 +565,26 @@ endpolynotextnogou:
 					// GOURAUD, DITHER
 
 					u32 uSrc24 = gpuLightingRGB24(l_gCol);
-					if (CF_BLEND)
-						uSrc24 = gpuBlending24<CF_BLENDMODE>(uSrc24, uDst);
+					if (CF_BLEND) {
+						// QPSX_090: Use fast blending if enabled
+						if (FastBlendingEnabled())
+							uSrc24 = gpuBlending24_Fast<CF_BLENDMODE>(uSrc24, uDst);
+						else
+							uSrc24 = gpuBlending24<CF_BLENDMODE>(uSrc24, uDst);
+					}
 					uSrc = gpuColorQuantization24<CF_DITHER>(uSrc24, pDst);
 				} else {
 					// GOURAUD, NO DITHER
 
 					uSrc = gpuLightingRGB(l_gCol);
 
-					if (CF_BLEND)
-						uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+					if (CF_BLEND) {
+						// QPSX_090: Use fast blending if enabled
+						if (FastBlendingEnabled())
+							uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+						else
+							uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+					}
 				}
 
 				if (CF_MASKSET) { *pDst = uSrc | 0x8000; }
@@ -621,15 +675,25 @@ endpolynotextgou:
 				if (!CF_GOURAUD)
 					uSrc24 = gpuLightingTXT24(uSrc, r8, g8, b8);
 
-				if (CF_BLEND && srcMSB)
-					uSrc24 = gpuBlending24<CF_BLENDMODE>(uSrc24, uDst);
+				if (CF_BLEND && srcMSB) {
+					// QPSX_090: Use fast blending if enabled
+					if (FastBlendingEnabled())
+						uSrc24 = gpuBlending24_Fast<CF_BLENDMODE>(uSrc24, uDst);
+					else
+						uSrc24 = gpuBlending24<CF_BLENDMODE>(uSrc24, uDst);
+				}
 
 				uSrc = gpuColorQuantization24<CF_DITHER>(uSrc24, pDst);
 			} else
 			{
 				if (CF_LIGHT) {
-					// QPSX_081: Use fast lighting if enabled
-					if (FastLightingEnabled()) {
+					// QPSX_091: Priority: ASM > Fast > LUT
+					if (AsmLightingEnabled()) {
+						if ( CF_GOURAUD)
+							uSrc = gpuLightingTXTGouraud_ASM(uSrc, l_gCol);
+						if (!CF_GOURAUD)
+							uSrc = gpuLightingTXT_ASM(uSrc, r5, g5, b5);
+					} else if (FastLightingEnabled()) {
 						if ( CF_GOURAUD)
 							uSrc = gpuLightingTXTGouraud_Fast(uSrc, l_gCol);
 						if (!CF_GOURAUD)
@@ -642,8 +706,15 @@ endpolynotextgou:
 					}
 				}
 
-				if (CF_BLEND && srcMSB)
-					uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				if (CF_BLEND && srcMSB) {
+					// QPSX_091: Priority: ASM > Fast > Original
+					if (AsmBlendingEnabled())
+						uSrc = gpuBlending_ASM<CF_BLENDMODE>(uSrc, uDst);
+					else if (FastBlendingEnabled())
+						uSrc = gpuBlending_Fast<CF_BLENDMODE>(uSrc, uDst);
+					else
+						uSrc = gpuBlending<CF_BLENDMODE, skip_uSrc_mask>(uSrc, uDst);
+				}
 			}
 
 			if (CF_MASKSET)                { *pDst = uSrc | 0x8000; }

@@ -564,15 +564,19 @@ void cdrPlayInterrupt()
 	if (!cdr.Play) return;
 
 	/*
-	 * QPSX_086: Batched CDDA audio feeding (optimized)
+	 * QPSX_253: Optimized CDDA batching with bulk read
 	 *
-	 * v085 read 1 sector per interrupt = 75 I/O ops/sec (slow!)
-	 * v086 reads 8 sectors at once every 8 interrupts = ~9 I/O ops/sec
+	 * v086: 8 sectors, 8 fread calls = ~9 I/O ops/sec
+	 * v253: 32 sectors, 1 fread call = ~2.3 I/O ops/sec (4x fewer I/O operations!)
 	 *
-	 * This dramatically reduces SD card access overhead.
+	 * The key optimization is CDR_readCDDA_batch() which reads all sectors
+	 * with a single fseek+fread instead of one per sector. This is critical
+	 * for SF2000's slow SD card.
+	 *
+	 * 32 sectors = 75264 bytes = ~0.43 sec of audio buffered
 	 * Batch is invalidated on seek (position mismatch).
 	 */
-#define CDDA_BATCH_SIZE 8
+#define CDDA_BATCH_SIZE 32
 	if (!Config.Cdda && !cdr.Muted) {
 		static unsigned char cdda_batch[CD_FRAMESIZE_RAW * CDDA_BATCH_SIZE];
 		static int cdda_batch_pos = CDDA_BATCH_SIZE;  /* Force initial read */
@@ -585,20 +589,10 @@ void cdrPlayInterrupt()
 			cdda_batch_pos = CDDA_BATCH_SIZE;  /* Invalidate */
 		}
 
-		/* Refill batch if empty */
+		/* Refill batch if empty - v253: single bulk read instead of loop */
 		if (cdda_batch_pos >= CDDA_BATCH_SIZE) {
-			unsigned char m = cdr.SetSectorPlay[0];
-			unsigned char s = cdr.SetSectorPlay[1];
-			unsigned char f = cdr.SetSectorPlay[2];
-			int i;
-
-			for (i = 0; i < CDDA_BATCH_SIZE; i++) {
-				CDR_readCDDA(m, s, f, cdda_batch + i * CD_FRAMESIZE_RAW);
-				/* Increment MSF for next sector */
-				f++;
-				if (f >= 75) { f = 0; s++; }
-				if (s >= 60) { s = 0; m++; }
-			}
+			CDR_readCDDA_batch(cdr.SetSectorPlay[0], cdr.SetSectorPlay[1],
+			                   cdr.SetSectorPlay[2], cdda_batch, CDDA_BATCH_SIZE);
 			cdda_batch_pos = 0;
 		}
 

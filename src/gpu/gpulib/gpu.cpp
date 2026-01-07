@@ -14,6 +14,7 @@
 #include "plugins.h"    // For GPUFreeze_t, GPUScreenInfo_t
 #include "gpu.h"
 #include "plugin_lib.h"
+#include "profiler.h"   /* v092: Profiler support */
 
 /* SF2000 xlog debugging */
 #ifdef SF2000
@@ -533,6 +534,8 @@ static noinline int do_cmd_list_skip(uint32_t *data, int count, int *last_cmd)
 
 static noinline int do_cmd_buffer(uint32_t *data, int count)
 {
+  PROFILE_START(PROF_GPU_TOTAL);
+
   int cmd, pos;
   uint32_t old_e3 = gpu.ex_regs[3];
   int vram_dirty = 0;
@@ -577,6 +580,7 @@ static noinline int do_cmd_buffer(uint32_t *data, int count)
   if (old_e3 != gpu.ex_regs[3])
     decide_frameskip_allow(gpu.ex_regs[3]);
 
+  PROFILE_END(PROF_GPU_TOTAL);
   return count - pos;
 }
 

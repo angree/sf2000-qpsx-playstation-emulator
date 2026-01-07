@@ -42,6 +42,10 @@ struct gpu_unai_config_t {
 	uint8_t fast_lighting:1;
 	uint8_t blending:1;
 	uint8_t dithering:1;
+	uint8_t fast_blending:1;  // QPSX v090: Branchless blending optimization
+	uint8_t asm_lighting:1;   // QPSX v091: MIPS32 assembly lighting (MOVN/MOVZ)
+	uint8_t asm_blending:1;   // QPSX v091: MIPS32 assembly blending (EXT/INS)
+	uint8_t prefetch_tex:1;   // QPSX v091: Cache prefetch for textures
 
 	//senquack Only PCSX Rearmed's version of gpu_unai had this, and I
 	// don't think it's necessary. It would require adding 'AH' flag to

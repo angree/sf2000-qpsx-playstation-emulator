@@ -52,6 +52,7 @@
 #include "mdec.h"
 #include "cdrom.h"
 #include "gpu.h"
+#include "profiler.h"  /* v094: Detailed CPU profiling */
 
 void psxHwReset() {
 	//senquack - added Config.SpuIrq option from PCSX Rearmed/Reloaded:
