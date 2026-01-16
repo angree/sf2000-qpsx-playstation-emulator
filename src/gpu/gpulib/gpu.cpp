@@ -750,6 +750,11 @@ long GPU_freeze(uint32_t type, GPUFreeze_t *freeze)
 
 void GPU_updateLace(void)
 {
+  /* v308 DEBUG: Track why video might not be output */
+  static int gpu_lace_count = 0;
+  /* v310: removed debug logging */
+  (void)gpu_lace_count;  /* suppress unused warning */
+
   if (gpu.cmd_len > 0)
     flush_cmd_buffer();
   renderer_flush_queues();

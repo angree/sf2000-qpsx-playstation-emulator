@@ -32,9 +32,9 @@
 #include "spu_config.h"
 #include "profiler.h"   /* v092: Profiler support */
 
-/* v110: CDDA speedup options (runtime) - defined in libretro-core.cpp */
-extern int g_opt_cdda_fast_mix;     /* Skip spu.spuMem writes for SPU Capture */
-extern int g_opt_cdda_unity_vol;    /* Skip volume multiply when vol=100% */
+/* v367b: CDDA speedup options HARDCODED ON */
+#define g_opt_cdda_fast_mix   1
+#define g_opt_cdda_unity_vol  1
 
 #ifdef __arm__
 #include "arm_features.h"

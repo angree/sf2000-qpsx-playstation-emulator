@@ -52,8 +52,28 @@
 
 #define OFF_T_MSB ((off_t)1 << (sizeof(off_t) * 8 - 1))
 
-/* v257: Compressed CDDA support */
-extern int g_opt_cdda_binsav;  /* Enable compressed CDDA (.binadpcm / .binwav) */
+/* v367b: Compressed CDDA support HARDCODED ON */
+#define g_opt_cdda_binsav   1
+
+/* v367b: CDDA track preload HARDCODED to 1.5M */
+#define g_opt_cdda_preload  3
+#define CDDA_PRELOAD_BUFFER_SIZE (1536 * 1024)  /* 1.5MB buffer */
+static unsigned char *cdda_preload_buffer = NULL;
+static int cdda_preload_track = -1;        /* Which track is preloaded (-1 = none) */
+static int cdda_preload_size = 0;          /* Size of preloaded data */
+static int cdda_preload_file_offset = 0;   /* File offset where preloaded data starts */
+static int cdda_preload_sector_size = 0;   /* Sector size for preloaded track */
+static int cdda_preload_format = 0;        /* Format of preloaded track */
+
+/* v341: Get preload threshold in bytes based on setting */
+static inline int cdda_get_preload_threshold(void) {
+    switch (g_opt_cdda_preload) {
+        case 1: return 512 * 1024;   /* <0.5M */
+        case 2: return 1024 * 1024;  /* <1M */
+        case 3: return 1536 * 1024;  /* <1.5M */
+        default: return 0;           /* OFF */
+    }
+}
 
 /*
  * v257: Compressed CDDA support
@@ -266,10 +286,7 @@ static struct trackinfo ti[MAXTRACKS];
 static void upgrade_cdda_formats(void) {
 	int i;
 	static char alt_path[MAXPATHLEN];
-
-	if (!g_opt_cdda_binsav) {
-		return;
-	}
+	/* v367b: g_opt_cdda_binsav hardcoded ON - no check needed */
 
 	for (i = 1; i <= numtracks; i++) {
 		/* Only process AUDIO tracks with valid handles and paths */
@@ -906,16 +923,100 @@ static int parsecue(const char *isofile) {
 
 			file_len = 0;
 			if (ti[numtracks + 1].handle == NULL) {
-				printf(("\ncould not open: %s\n"), filepath);
-				continue;
+				/* v297: Try compressed CDDA formats when .bin doesn't exist */
+				static char alt_path[MAXPATHLEN];
+				char* ext_pos;
+				int found_alt = 0;
+
+				/* Try .binadpcm first (smallest, IMA ADPCM) */
+				strncpy(alt_path, filepath, MAXPATHLEN - 12);
+				alt_path[MAXPATHLEN - 12] = '\0';
+				ext_pos = strrchr(alt_path, '.');
+				if (ext_pos && strcasecmp(ext_pos, ".bin") == 0) {
+					strcpy(ext_pos, ".binadpcm");
+					ti[numtracks + 1].handle = fopen(alt_path, "rb");
+					if (ti[numtracks + 1].handle != NULL) {
+						strncpy(filepath, alt_path, sizeof(filepath));
+						ti[numtracks + 1].cdda_format = CDDA_FMT_BINADPCM;
+						printf("CDDA: Using .binadpcm instead of missing .bin\n");
+						found_alt = 1;
+					}
+				}
+
+				/* Try .binwav second (raw PCM) */
+				if (!found_alt && ext_pos) {
+					strcpy(ext_pos, ".binwav");
+					ti[numtracks + 1].handle = fopen(alt_path, "rb");
+					if (ti[numtracks + 1].handle != NULL) {
+						strncpy(filepath, alt_path, sizeof(filepath));
+						ti[numtracks + 1].cdda_format = CDDA_FMT_BINWAV;
+						printf("CDDA: Using .binwav instead of missing .bin\n");
+						found_alt = 1;
+					}
+				}
+
+				/* Also try in subfolder */
+				if (!found_alt && subfolder_path[0] != '\0') {
+					snprintf(alt_path, sizeof(alt_path), "%s%s", subfolder_path, tmp);
+					ext_pos = strrchr(alt_path, '.');
+					if (ext_pos && strcasecmp(ext_pos, ".bin") == 0) {
+						/* Try .binadpcm in subfolder */
+						strcpy(ext_pos, ".binadpcm");
+						ti[numtracks + 1].handle = fopen(alt_path, "rb");
+						if (ti[numtracks + 1].handle != NULL) {
+							strncpy(filepath, alt_path, sizeof(filepath));
+							ti[numtracks + 1].cdda_format = CDDA_FMT_BINADPCM;
+							printf("CDDA: Using subfolder .binadpcm\n");
+							found_alt = 1;
+						}
+
+						/* Try .binwav in subfolder */
+						if (!found_alt) {
+							strcpy(ext_pos, ".binwav");
+							ti[numtracks + 1].handle = fopen(alt_path, "rb");
+							if (ti[numtracks + 1].handle != NULL) {
+								strncpy(filepath, alt_path, sizeof(filepath));
+								ti[numtracks + 1].cdda_format = CDDA_FMT_BINWAV;
+								printf("CDDA: Using subfolder .binwav\n");
+								found_alt = 1;
+							}
+						}
+					}
+				}
+
+				if (!found_alt) {
+					printf(("\ncould not open: %s (or .binadpcm/.binwav)\n"), filepath);
+					continue;
+				}
 			}
 			/* v257: Store filepath for compressed format lookup later */
 			strncpy(ti[numtracks + 1].filepath, filepath, MAXPATHLEN - 1);
 			ti[numtracks + 1].filepath[MAXPATHLEN - 1] = '\0';
-			ti[numtracks + 1].cdda_format = CDDA_FMT_BIN;
+			/* v297: Only set BIN format if not already set by fallback code */
+			if (ti[numtracks + 1].cdda_format == 0) {
+				ti[numtracks + 1].cdda_format = CDDA_FMT_BIN;
+			}
 
 			fseek(ti[numtracks + 1].handle, 0, SEEK_END);
-			file_len = ftell(ti[numtracks + 1].handle) / 2352;
+			/* v297: Calculate file_len based on actual format (sector size varies!) */
+			{
+				long file_size = ftell(ti[numtracks + 1].handle);
+				int sector_size;
+				switch (ti[numtracks + 1].cdda_format) {
+					case CDDA_FMT_BINADPCM:
+						sector_size = BINADPCM_SECTOR_SIZE;  /* 152 bytes */
+						break;
+					case CDDA_FMT_BINWAV:
+						sector_size = BINWAV_SECTOR_SIZE;    /* 588 bytes */
+						break;
+					default:
+						sector_size = CD_FRAMESIZE_RAW;      /* 2352 bytes */
+						break;
+				}
+				file_len = file_size / sector_size;
+				printf("Track %d: format=%d, size=%ld, sectors=%u\n",
+				       numtracks + 1, ti[numtracks + 1].cdda_format, file_size, file_len);
+			}
 
 			if (numtracks == 0 && strlen(isofile) >= 4 &&
 				strcmp(isofile + strlen(isofile) - 4, ".cue") == 0)
@@ -1917,7 +2018,7 @@ long CDR_readTrack(unsigned char *time) {
 // sector: byte 0 - minute; byte 1 - second; byte 2 - frame
 // does NOT uses bcd format
 long CDR_play(unsigned char *time) {
-	unsigned int i;
+	unsigned int i, file_idx;
 
 	if (numtracks <= 1)
 		return 0;
@@ -1932,11 +2033,59 @@ long CDR_play(unsigned char *time) {
 	cdda_file_offset = ti[i].start_offset;
 
 	// find the file that contains this track
-	for (; i > 1; i--)
-		if (ti[i].handle != NULL)
+	file_idx = i;
+	for (; file_idx > 1; file_idx--)
+		if (ti[file_idx].handle != NULL)
 			break;
 
-	cddaHandle = ti[i].handle;
+	cddaHandle = ti[file_idx].handle;
+
+	/* v341: Try to preload small CDDA tracks into RAM */
+	int threshold = cdda_get_preload_threshold();
+	if (threshold > 0 && ti[i].type == CDDA && ti[file_idx].handle != NULL) {
+		/* Calculate track size in bytes based on format */
+		int track_sectors = msf2sec(ti[i].length);
+		int sector_size;
+		switch (ti[file_idx].cdda_format) {
+			case CDDA_FMT_BINADPCM: sector_size = BINADPCM_SECTOR_SIZE; break;
+			case CDDA_FMT_BINWAV:   sector_size = BINWAV_SECTOR_SIZE; break;
+			default:                sector_size = CD_FRAMESIZE_RAW; break;
+		}
+		int track_size = track_sectors * sector_size;
+
+		/* Check if track is small enough and not already preloaded */
+		if (track_size > 0 && track_size <= threshold && (int)i != cdda_preload_track) {
+			/* Allocate buffer if needed */
+			if (cdda_preload_buffer == NULL) {
+				cdda_preload_buffer = (unsigned char *)malloc(CDDA_PRELOAD_BUFFER_SIZE);
+			}
+
+			if (cdda_preload_buffer != NULL) {
+				/* Calculate file offset based on format */
+				int file_offset;
+				if (ti[file_idx].cdda_format == CDDA_FMT_BINADPCM) {
+					file_offset = (ti[i].start_offset * BINADPCM_SECTOR_SIZE) / CD_FRAMESIZE_RAW;
+				} else if (ti[file_idx].cdda_format == CDDA_FMT_BINWAV) {
+					file_offset = ti[i].start_offset / 4;
+				} else {
+					file_offset = ti[i].start_offset;
+				}
+
+				/* Load track into buffer */
+				if (fseek(ti[file_idx].handle, file_offset, SEEK_SET) == 0) {
+					int read = fread(cdda_preload_buffer, 1, track_size, ti[file_idx].handle);
+					if (read == track_size) {
+						cdda_preload_track = i;
+						cdda_preload_size = track_size;
+						cdda_preload_file_offset = file_offset;
+						cdda_preload_sector_size = sector_size;
+						cdda_preload_format = ti[file_idx].cdda_format;
+						printf("v341: Preloaded CDDA track %d (%d KB)\n", i, track_size / 1024);
+					}
+				}
+			}
+		}
+	}
 
 	// Uncomment when SPU_playCDDAchannel is a func ptr again
 	//if (SPU_playCDDAchannel != NULL)
@@ -2022,6 +2171,59 @@ long CDR_readCDDA(unsigned char m, unsigned char s, unsigned char f, unsigned ch
 		for (file = track; file > 1; file--)
 			if (ti[file].handle != NULL)
 				break;
+	}
+
+	/*
+	 * v341: Check if track is preloaded in RAM
+	 */
+	if ((int)track == cdda_preload_track && cdda_preload_buffer != NULL) {
+		unsigned int sector = cddaCurPos - track_start;
+		int offset_in_buffer = sector * cdda_preload_sector_size;
+
+		if (offset_in_buffer >= 0 && offset_in_buffer + cdda_preload_sector_size <= cdda_preload_size) {
+			unsigned char *src = cdda_preload_buffer + offset_in_buffer;
+
+			/* Handle different formats from preloaded data */
+			if (cdda_preload_format == CDDA_FMT_BINADPCM) {
+				/* Decode ADPCM from preloaded buffer */
+				short *out = (short *)buffer;
+				int16_t predictor = (int16_t)(src[0] | (src[1] << 8));
+				int step_idx = src[2];
+				if (step_idx > 88) step_idx = 88;
+				unsigned char *data = src + BINADPCM_HEADER_SIZE;
+				for (int i = 0; i < BINADPCM_DATA_SIZE; i++) {
+					unsigned char byte = data[i];
+					int16_t sample1 = ima_decode_sample(byte & 0x0F, &predictor, &step_idx);
+					int16_t sample2 = ima_decode_sample((byte >> 4) & 0x0F, &predictor, &step_idx);
+					*out++ = sample1; *out++ = sample1; *out++ = sample1; *out++ = sample1;
+					*out++ = sample2; *out++ = sample2; *out++ = sample2; *out++ = sample2;
+				}
+				return 0;
+			}
+			else if (cdda_preload_format == CDDA_FMT_BINWAV) {
+				/* Upsample from preloaded buffer */
+				short *out = (short *)buffer;
+				short *in = (short *)src;
+				for (int i = 0; i < 294; i++) {
+					short sample = in[i];
+					*out++ = sample; *out++ = sample; *out++ = sample; *out++ = sample;
+				}
+				return 0;
+			}
+			else {
+				/* Raw PCM - just copy */
+				memcpy(buffer, src, CD_FRAMESIZE_RAW);
+				if (cddaBigEndian) {
+					unsigned char tmp;
+					for (int i = 0; i < CD_FRAMESIZE_RAW / 2; i++) {
+						tmp = buffer[i * 2];
+						buffer[i * 2] = buffer[i * 2 + 1];
+						buffer[i * 2 + 1] = tmp;
+					}
+				}
+				return 0;
+			}
+		}
 	}
 
 	/*

@@ -32,30 +32,10 @@
 #include "psxhw.h"
 #include "profiler.h"  /* v094: Detailed CPU profiling */
 
-/* v103: Memory optimization flags from libretro-core.cpp */
-extern int g_opt_skip_code_inv;   /* Skip code invalidation after stores (RISK!) */
-/*
- * v104: g_opt_asm_memwrite - 7 levels (0-6) for precise debugging
- *
- * FIXED in v104: Split address calculation into separate asm blocks!
- *
- * The v103 bug was: "=&r" constraint only prevents overlap with INPUTS,
- * NOT with other OUTPUTS. GCC could allocate same register for t and m,
- * causing corruption when the second instruction overwrote the first's result.
- *
- * Fix: One instruction per asm block guarantees distinct registers
- * because both t and m are live after both asm blocks.
- *
- * Levels:
- *   0 = OFF      : Pure C path (baseline)
- *   1 = V98      : ASM(ptr_arith + store), C(addr_calc, HW, LUT, codeinv) - WORKS!
- *   2 = +ADDR    : ASM(addr_calc + ptr_arith + store), C(HW, LUT, codeinv)
- *   3 = +LUT     : ASM(addr_calc + LUT + ptr_arith + store), C(HW, codeinv)
- *   4 = +HWBR    : ASM(addr_calc + LUT + HW_branch + ptr_arith + store), C(HW_call, codeinv)
- *   5 = +HWCALL  : ASM(everything except codeinv), C(codeinv only)
- *   6 = FULL     : Full psxmem_asm.S (everything in ASM)
- */
-extern int g_opt_asm_memwrite;
+/* v367: Memory optimizations HARDCODED:
+ * - g_opt_skip_code_inv = 0 (always do code invalidation)
+ * - g_opt_asm_memwrite = 0 (pure C path)
+ * All IF checks and ASM levels REMOVED from source code. */
 
 /* v099: Pure assembly memory functions (defined in psxmem_asm.S) */
 #if defined(SF2000) || defined(__mips__)
@@ -449,14 +429,7 @@ void psxMemShutdown()
 /* v102: psxMemRead8 with multi-level ASM support */
 u8 psxMemRead8(u32 mem)
 {
-#if defined(SF2000) || defined(__mips__)
-	/* Level 2 = Full psxmem_asm.S */
-	if (g_opt_asm_memwrite == 2) {
-		return psxMemRead8_asm(mem);
-	}
-	/* Level 1 = Same as C (no ASM read optimization in v98) */
-#endif
-
+	/* v367: HARDCODED pure C */
 	memstats_add_read(mem, MEMSTAT_WIDTH_8);
 	u8 ret;
 	u32 t = mem >> 16;
@@ -479,17 +452,9 @@ u8 psxMemRead8(u32 mem)
 	return ret;
 }
 
-/* v102: psxMemRead16 with multi-level ASM support */
+/* v367: psxMemRead16 - HARDCODED pure C */
 u16 psxMemRead16(u32 mem)
 {
-#if defined(SF2000) || defined(__mips__)
-	/* Level 2 = Full psxmem_asm.S */
-	if (g_opt_asm_memwrite == 2) {
-		return psxMemRead16_asm(mem);
-	}
-	/* Level 1 = Same as C (no ASM read optimization in v98) */
-#endif
-
 	memstats_add_read(mem, MEMSTAT_WIDTH_16);
 	u16 ret;
 	u32 t = mem >> 16;
@@ -512,17 +477,9 @@ u16 psxMemRead16(u32 mem)
 	return ret;
 }
 
-/* v102: psxMemRead32 with multi-level ASM support */
+/* v367: psxMemRead32 - HARDCODED pure C */
 u32 psxMemRead32(u32 mem)
 {
-#if defined(SF2000) || defined(__mips__)
-	/* Level 2 = Full psxmem_asm.S */
-	if (g_opt_asm_memwrite == 2) {
-		return psxMemRead32_asm(mem);
-	}
-	/* Level 1 = Same as C (no ASM read optimization in v98) */
-#endif
-
 	PROFILE_START(PROF_CPU_MEM_READ);
 	memstats_add_read(mem, MEMSTAT_WIDTH_32);
 	u32 ret;
@@ -550,47 +507,7 @@ u32 psxMemRead32(u32 mem)
 /* v102: psxMemWrite8 with multi-level ASM support */
 void psxMemWrite8(u32 mem, u8 value)
 {
-#if defined(SF2000) || defined(__mips__)
-	/* Level 2 = Full psxmem_asm.S */
-	if (g_opt_asm_memwrite == 2) {
-		psxMemWrite8_asm(mem, value);
-		return;
-	}
-
-	/* Level 1 = v98-style inline ASM (store only) */
-	if (g_opt_asm_memwrite == 1) {
-		u32 t = mem >> 16;
-		u32 m = mem & 0xffff;
-
-		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
-			if (m < 0x400)
-				psxHu8(mem) = value;
-			else
-				psxHwWrite8(mem, value);
-			return;
-		}
-
-		u8 *p = (u8*)(psxMemWLUT[t]);
-		if (p != NULL) {
-			/* Inline ASM store only */
-			__asm__ volatile(
-				"addu $t0, %0, %1\n\t"
-				"sb   %2, 0($t0)\n\t"
-				:
-				: "r"(p), "r"(m), "r"(value)
-				: "$t0", "memory"
-			);
-#ifdef PSXREC
-			if (!g_opt_skip_code_inv) {
-				psxCpu->Clear((mem & (~3)), 1);
-			}
-#endif
-		}
-		return;
-	}
-#endif
-
-	/* Level 0 = Pure C */
+	/* v367: HARDCODED pure C - ASM levels removed, code inv always ON */
 	memstats_add_write(mem, MEMSTAT_WIDTH_8);
 	u32 t = mem >> 16;
 	u32 m = mem & 0xffff;
@@ -604,10 +521,7 @@ void psxMemWrite8(u32 mem, u8 value)
 		if (p != NULL) {
 			*(u8*)(p + m) = value;
 #ifdef PSXREC
-			/* v098: Skip code invalidation if option enabled (RISK!) */
-			if (!g_opt_skip_code_inv) {
-				psxCpu->Clear((mem & (~3)), 1);
-			}
+			psxCpu->Clear((mem & (~3)), 1);
 #endif
 		} else {
 			PSXMEM_LOG("%s(): err sb 0x%08x\n", __func__, mem);
@@ -615,50 +529,9 @@ void psxMemWrite8(u32 mem, u8 value)
 	}
 }
 
-/* v102: psxMemWrite16 with multi-level ASM support */
+/* v367: psxMemWrite16 - HARDCODED pure C, ASM removed, code inv always ON */
 void psxMemWrite16(u32 mem, u16 value)
 {
-#if defined(SF2000) || defined(__mips__)
-	/* Level 2 = Full psxmem_asm.S */
-	if (g_opt_asm_memwrite == 2) {
-		psxMemWrite16_asm(mem, value);
-		return;
-	}
-
-	/* Level 1 = v98-style inline ASM (store only) */
-	if (g_opt_asm_memwrite == 1) {
-		u32 t = mem >> 16;
-		u32 m = mem & 0xffff;
-
-		if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
-			if (m < 0x400)
-				psxHu16ref(mem) = SWAPu16(value);
-			else
-				psxHwWrite16(mem, value);
-			return;
-		}
-
-		u8 *p = (u8*)(psxMemWLUT[t]);
-		if (p != NULL) {
-			/* Inline ASM store only */
-			__asm__ volatile(
-				"addu $t0, %0, %1\n\t"
-				"sh   %2, 0($t0)\n\t"
-				:
-				: "r"(p), "r"(m), "r"(value)
-				: "$t0", "memory"
-			);
-#ifdef PSXREC
-			if (!g_opt_skip_code_inv) {
-				psxCpu->Clear((mem & (~3)), 1);
-			}
-#endif
-		}
-		return;
-	}
-#endif
-
-	/* Level 0 = Pure C */
 	memstats_add_write(mem, MEMSTAT_WIDTH_16);
 	u32 t = mem >> 16;
 	u32 m = mem & 0xffff;
@@ -672,10 +545,7 @@ void psxMemWrite16(u32 mem, u16 value)
 		if (p != NULL) {
 			*(u16*)(p + m) = SWAPu16(value);
 #ifdef PSXREC
-			/* v098: Skip code invalidation if option enabled (RISK!) */
-			if (!g_opt_skip_code_inv) {
-				psxCpu->Clear((mem & (~3)), 1);
-			}
+			psxCpu->Clear((mem & (~3)), 1);
 #endif
 		} else {
 			PSXMEM_LOG("%s(): err sh 0x%08x\n", __func__, mem);
@@ -698,10 +568,44 @@ void psxMemWrite16(u32 mem, u16 value)
  */
 void psxMemWrite32(u32 mem, u32 value)
 {
-#if defined(SF2000) || defined(__mips__)
+	/* v367: HARDCODED pure C path - all ASM levels removed */
+	PROFILE_START(PROF_CPU_MEM_WRITE);
+	memstats_add_write(mem, MEMSTAT_WIDTH_32);
+	u32 t = mem >> 16;
+	u32 m = mem & 0xffff;
+	if (t == 0x1f80 || t == 0x9f80 || t == 0xbf80) {
+		if (m < 0x400)
+			psxHu32ref(mem) = SWAPu32(value);
+		else
+			psxHwWrite32(mem, value);
+	} else {
+		u8 *p = (u8*)(psxMemWLUT[t]);
+		if (p != NULL) {
+			*(u32*)(p + m) = SWAPu32(value);
+#ifdef PSXREC
+			/* v367: Always do code invalidation (hardcoded) */
+			psxCpu->Clear(mem, 1);
+#endif
+		} else {
+			if (mem != 0xfffe0130) {
+#ifdef PSXREC
+				if (!psxRegs.writeok) psxCpu->Clear(mem, 1);
+#endif
+				if (psxRegs.writeok) { PSXMEM_LOG("%s(): err sw 0x%08x\n", __func__, mem); }
+			} else {
+				psxMemWrite32_CacheCtrlPort(value);
+			}
+		}
+	}
+	PROFILE_END(PROF_CPU_MEM_WRITE);
+}
 
-	/* ========== LEVEL 6: FULL psxmem_asm.S ========== */
-	if (g_opt_asm_memwrite == 6) {
+#if 0  /* v367: ASM levels 1-6 REMOVED - dead code */
+void psxMemWrite32_REMOVED(u32 mem, u32 value)
+{
+#if defined(SF2000) || defined(__mips__)
+	/* LEVEL 6 */
+	if (0) {
 		psxMemWrite32_asm(mem, value);
 		return;
 	}
@@ -1004,6 +908,7 @@ void psxMemWrite32(u32 mem, u32 value)
 	}
 	PROFILE_END(PROF_CPU_MEM_WRITE);
 }
+#endif  /* v367: end of #if 0 - removed ASM levels */
 
 // Write to cache control port 0xfffe0130
 void psxMemWrite32_CacheCtrlPort(u32 value)

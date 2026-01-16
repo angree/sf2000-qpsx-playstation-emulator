@@ -25,7 +25,7 @@ echo Core name: %CORE_NAME%
 
 echo.
 echo [1/5] Cleaning previous build...
-wsl -e bash -c "cd '%WSL_QPSX_PATH%' && rm -f src/*.o src/**/*.o libretro/**/*.o 2>/dev/null; true"
+wsl -e bash -c "cd '%WSL_QPSX_PATH%' && find . -name '*.o' -delete 2>/dev/null; find . -name '*.a' -delete 2>/dev/null; true"
 
 echo.
 echo [2/5] Compiling %CORE_NAME% library...

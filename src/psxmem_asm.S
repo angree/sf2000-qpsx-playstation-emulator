@@ -20,8 +20,8 @@
  *     - psxH: Hardware registers base
  *     - psxHwWrite32/16/8: HW write functions (extern "C" in psxhw.h)
  *     - psxHwRead32/16/8: HW read functions (extern "C" in psxhw.h)
- *     - g_opt_skip_code_inv: Skip code invalidation flag
  *     - recClear: Code invalidation function (extern "C" in recompiler.cpp)
+ *   v367: g_opt_skip_code_inv REMOVED - code invalidation always happens
  *
  ***************************************************************************/
 
@@ -45,7 +45,7 @@
     .extern psxHwRead32
     .extern psxHwRead16
     .extern psxHwRead8
-    .extern g_opt_skip_code_inv
+    /* v367: g_opt_skip_code_inv REMOVED - hardcoded to always do recClear */
     .extern recClear
 
 /*==========================================================================
@@ -86,14 +86,8 @@ psxMemWrite32_asm:
     sw      $a1, 0($t5)             /* *(u32*)(p + m) = value */
 
     /*----------------------------------------------------------------------
-     * v101: Code invalidation (if not skipped)
-     * Check g_opt_skip_code_inv flag - RESTORED from v099!
+     * v367: Code invalidation - ALWAYS (g_opt_skip_code_inv hardcoded to 0)
      *----------------------------------------------------------------------*/
-    la      $t0, g_opt_skip_code_inv
-    lw      $t0, 0($t0)             /* $t0 = g_opt_skip_code_inv */
-    bnez    $t0, .Ldone32           /* if skip enabled, return */
-    nop
-
     /* Call recClear(mem, 1) for code invalidation */
     addiu   $sp, $sp, -8
     sw      $ra, 4($sp)
@@ -176,12 +170,7 @@ psxMemWrite16_asm:
     addu    $t5, $t4, $t3           /* $t5 = p + m */
     sh      $a1, 0($t5)             /* *(u16*)(p + m) = value */
 
-    /* v101: Code invalidation check - RESTORED */
-    la      $t0, g_opt_skip_code_inv
-    lw      $t0, 0($t0)
-    bnez    $t0, .Ldone16
-    nop
-
+    /* v367: Code invalidation - ALWAYS (hardcoded) */
     /* Align address for Clear: mem & ~3 */
     addiu   $sp, $sp, -8
     sw      $ra, 4($sp)
@@ -250,12 +239,7 @@ psxMemWrite8_asm:
     addu    $t5, $t4, $t3           /* $t5 = p + m */
     sb      $a1, 0($t5)             /* *(u8*)(p + m) = value */
 
-    /* v101: Code invalidation check - RESTORED */
-    la      $t0, g_opt_skip_code_inv
-    lw      $t0, 0($t0)
-    bnez    $t0, .Ldone8
-    nop
-
+    /* v367: Code invalidation - ALWAYS (hardcoded) */
     /* Align address for Clear: mem & ~3 */
     addiu   $sp, $sp, -8
     sw      $ra, 4($sp)

@@ -92,8 +92,10 @@ extern int MixCDDA_asm_inner_simple(int *SSumLR, uint32_t *src, int count, int v
 #define HAVE_CDDA_ASM 0
 #endif
 
-/* v111: ASM mixer option - defined in libretro-core.cpp */
-extern int g_opt_cdda_asm_mix;
+/* v367b: HARDCODED - all CDDA optimizations ON */
+#define g_opt_cdda_asm_mix    1
+#define g_opt_cdda_fast_mix   1
+#define g_opt_cdda_unity_vol  1
 
 INLINE void MixXA(int *SSumLR, int ns_to, int decode_pos)
 {
@@ -127,13 +129,7 @@ INLINE void MixXA(int *SSumLR, int ns_to, int decode_pos)
     }
     SSumLR[ns++] += l;
     SSumLR[ns++] += r;
-
-    /* v110: SPU Capture writes - skip if g_opt_cdda_fast_mix enabled */
-    if(!g_opt_cdda_fast_mix) {
-     spu.spuMem[cursor] = v;
-     spu.spuMem[cursor + 0x400/2] = v >> 16;
-     cursor = (cursor + 1) & 0x1ff;
-    }
+    /* v367b: SPU Capture REMOVED (g_opt_cdda_fast_mix hardcoded ON) */
    }
   spu.XALastVal = v;
  }
@@ -147,7 +143,7 @@ INLINE void MixXA(int *SSumLR, int ns_to, int decode_pos)
   * - We have contiguous samples to process
   */
 #if HAVE_CDDA_ASM
- if(g_opt_cdda_asm_mix && g_opt_cdda_fast_mix)
+ /* v367b: ASM always used (g_opt_cdda_asm_mix && g_opt_cdda_fast_mix hardcoded ON) */
  {
   /* ASM fast path - process CDDA in optimized assembly */
   ns = 0;
@@ -181,10 +177,9 @@ INLINE void MixXA(int *SSumLR, int ns_to, int decode_pos)
    if(spu.CDDAPlay >= spu.CDDAEnd) spu.CDDAPlay = spu.CDDAStart;
   }
  }
- else
-#endif /* HAVE_CDDA_ASM */
+#else /* !HAVE_CDDA_ASM */
  {
-  /* Original C path - used when ASM disabled or SPU capture needed */
+  /* Original C path - used when ASM not available */
   for(ns = 0; ns < ns_to * 2 && spu.CDDAPlay!=spu.CDDAFeed &&
       (spu.CDDAPlay!=spu.CDDAEnd-1||spu.CDDAFeed!=spu.CDDAStart);)
   {
@@ -201,15 +196,10 @@ INLINE void MixXA(int *SSumLR, int ns_to, int decode_pos)
    }
    SSumLR[ns++] += l;
    SSumLR[ns++] += r;
-
-   /* v110: SPU Capture writes - skip if g_opt_cdda_fast_mix enabled */
-   if(!g_opt_cdda_fast_mix) {
-    spu.spuMem[cursor] = v;
-    spu.spuMem[cursor + 0x400/2] = v >> 16;
-    cursor = (cursor + 1) & 0x1ff;
-   }
+   /* v367b: SPU Capture REMOVED (g_opt_cdda_fast_mix hardcoded ON) */
   }
  }
+#endif /* HAVE_CDDA_ASM */
 
   //senquack - update new XABufferRoom variable now that data's been read:
   UpdateXABufferRoom();

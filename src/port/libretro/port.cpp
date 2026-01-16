@@ -1,6 +1,6 @@
 /*
  * PCSX4ALL libretro port implementation
- * QPSX_282 - Cleaned up diagnostic logging
+ * QPSX_295 - Dual FPS counter (retro_run calls + real GPU frames)
  *
  * CRITICAL: This file does NOT call any SF2000 input functions!
  * All input is read from the cache set by update_input_cache() in libretro-core.cpp.
@@ -32,6 +32,9 @@ extern retro_video_refresh_t video_cb;
 extern retro_audio_sample_batch_t audio_batch_cb;
 
 extern volatile int skip_video_output;
+
+/* v295: GPU frame counter - counts ACTUAL rendered frames (not skipped/duped) */
+volatile int gpu_frame_count = 0;
 
 static unsigned tick_counter = 0;
 
@@ -97,6 +100,8 @@ void video_flip(void)
     if (skip_video_output) {
         video_cb(NULL, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
     } else if (SCREEN) {
+        /* v295: Count ACTUAL rendered frames (not skipped) */
+        gpu_frame_count++;
         video_cb(SCREEN, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
     }
 }

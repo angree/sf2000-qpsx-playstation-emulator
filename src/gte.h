@@ -59,4 +59,7 @@ u32 gtecalcMFC2(int reg);
 void gtecalcMTC2(u32 value, int reg);
 void gtecalcCTC2(u32 value, int reg);
 
+// v294: Update function pointer dispatch when ASM options change
+void gte_update_dispatch(void);
+
 #endif /* __GTE_H__ */

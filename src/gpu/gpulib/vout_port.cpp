@@ -9,6 +9,10 @@
  *  - GNU GPL, version 2 or later.
  *  - GNU LGPL, version 2.1 or later.
  * See the COPYING file in the top-level directory.
+ *
+ * v369: Removed line doubling and 2x2 pixel modes completely.
+ *       These added ~240 IF checks per frame overhead for no benefit.
+ *       Clean code like v066b.
  */
 
 #include <stdio.h>
@@ -402,29 +406,17 @@ static inline void GPU_BlitWS(const void* src, u16* dst16, bool isRGB24)
 	}
 }
 
-// Basically an adaption of old gpu_unai/gpu.cpp's gpuVideoOutput() that
-//  assumes 320x240 destination resolution (for now)
-// TODO: clean up / improve / add HW scaling support
+/* v369: Simple vout_update - NO line doubling, NO 2x2 mode
+ * Clean code like v066b - no unnecessary IFs in loops */
 void vout_update(void)
 {
 	const int VIDEO_WIDTH = 320;
-
-	//Debugging:
-#if 0
-	if (gpu.screen.w != gpu.screen.hres) {
-		int start_x = (gpu.screen.x1 - 0x260) * gpu.screen.hres / 2560;
-		int end_x = (gpu.screen.x2 - 0x260) * gpu.screen.hres / 2560;
-		int rounded_w= (((gpu.screen.x2 - gpu.screen.x1) / 2560) + 2) & (~3);
-		printf("screen.w: %d  screen.hres: %d  rounded_w:%d\n", gpu.screen.w, gpu.screen.hres, rounded_w);
-		printf("start_x: %d  end_x: %d  x1: %d  x2: %d\n", start_x, end_x, gpu.screen.x1, gpu.screen.x2);
-	}
-#endif
 
 	int x0 = gpu.screen.x;
 	int y0 = gpu.screen.y;
 	int w0 = gpu.screen.hres;
 	int h0 = gpu.screen.vres;
-	int h1 = gpu.screen.h;     // height of image displayed on screen
+	int h1 = gpu.screen.h;
 
 	if (w0 == 0 || h0 == 0)
 		return;
@@ -433,11 +425,9 @@ void vout_update(void)
 	u16* dst16 = SCREEN;
 	u16* src16 = (u16*)gpu.vram;
 
-	// PS1 fb read wraps around (fixes black screen in 'Tobal no. 1')
 	unsigned int src16_offs_msk = 1024*512-1;
 	unsigned int src16_offs = (x0 + y0*1024) & src16_offs_msk;
 
-	//  Height centering
 	int sizeShift = 1;
 	if (h0 == 256) {
 		h0 = 240;
@@ -473,7 +463,6 @@ void vout_update(void)
 		} break;
 
 		case 320: {
-			// Ensure 32-bit alignment for GPU_BlitWW() blitter:
 			src16_offs &= ~1;
 			for (int y1=y0+h1; y0<y1; y0+=incY) {
 				GPU_BlitWW(src16 + src16_offs, dst16, isRGB24);
@@ -520,7 +509,6 @@ int vout_finish(void)
 	return 0;
 }
 
-//senquack - Handles PSX display disabling (TODO: implement?)
 void vout_blank(void)
 {
 }

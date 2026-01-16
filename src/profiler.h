@@ -24,6 +24,13 @@
 #ifndef QPSX_PROFILER_H
 #define QPSX_PROFILER_H
 
+/*
+ * v368: PROFILER MASTER SWITCH
+ * Set to 1 to enable profiling (adds overhead to every mem access)
+ * Set to 0 for production builds (zero overhead)
+ */
+#define QPSX_PROFILER_ENABLED 0
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -148,8 +155,12 @@ static inline uint32_t profiler_read_cycles(void)
 extern uint32_t g_prof_start[PROF_COUNT];
 
 /*
+ * v368: Profiler macros - ZERO overhead when QPSX_PROFILER_ENABLED=0
+ */
+#if QPSX_PROFILER_ENABLED
+
+/*
  * PROFILE_START - Begin timing a section
- * Low overhead: ~4 cycles on MIPS
  */
 #define PROFILE_START(cat) \
     do { \
@@ -160,7 +171,6 @@ extern uint32_t g_prof_start[PROF_COUNT];
 
 /*
  * PROFILE_END - End timing a section
- * Low overhead: ~8 cycles on MIPS
  */
 #define PROFILE_END(cat) \
     do { \
@@ -171,7 +181,7 @@ extern uint32_t g_prof_start[PROF_COUNT];
     } while(0)
 
 /*
- * PROFILE_ADD - Directly add cycles (for cases where start/end don't work)
+ * PROFILE_ADD - Directly add cycles
  */
 #define PROFILE_ADD(cat, cyc) \
     do { \
@@ -179,6 +189,15 @@ extern uint32_t g_prof_start[PROF_COUNT];
             g_profiler.cycles[cat] += (cyc); \
         } \
     } while(0)
+
+#else /* QPSX_PROFILER_ENABLED == 0 */
+
+/* v368: Empty macros - ZERO overhead in production */
+#define PROFILE_START(cat)     do { } while(0)
+#define PROFILE_END(cat)       do { } while(0)
+#define PROFILE_ADD(cat, cyc)  do { } while(0)
+
+#endif /* QPSX_PROFILER_ENABLED */
 
 /*
  * Initialize profiler

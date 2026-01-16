@@ -21,54 +21,10 @@
 
 #include "gte.h"
 #include "psxmem.h"
-#include "profiler.h"
 
 // MIPS platforms have hardware divider, faster than 64KB LUT + UNR algo
 #if defined(__mips__)
 #define GTE_USE_NATIVE_DIVIDE
-#endif
-
-/*
- * QPSX v087: Optimized RTPT implementation
- * When enabled, uses loop unrolling and pre-loaded rotation matrix.
- * This avoids repeated memory accesses and enables better register allocation.
- */
-#if defined(__mips__) || defined(SF2000)
-#define GTE_USE_FAST_RTPT
-#endif
-
-/* External config flag for enabling/disabling fast RTPT (default: disabled) */
-extern int g_opt_rtpt_unroll;
-
-/*
- * QPSX v088: Two new GTE optimizations (EXPERIMENTAL - RISK!)
- *
- * 1. opt_gte_unrdiv - Use UNR (Unsigned Newton-Raphson) division
- *    Instead of hardware DIV (~36 cycles), use table lookup + 2 multiply iterations.
- *    Based on PSX hardware algorithm from psx-spx documentation.
- *    May or may not be faster depending on cache behavior.
- *
- * 2. opt_gte_noflags - Skip overflow checking in A1/A2/A3/F macros
- *    !!WARNING!! This can break games that read GTE flags!
- *    Most games don't care about overflow flags, but some do.
- *    Based on PCSX-ReARMed "FLAGLESS" optimization.
- */
-extern int g_opt_gte_unrdiv;   /* UNR division (default: OFF) */
-extern int g_opt_gte_noflags;  /* Skip overflow flags (default: OFF) - RISK! */
-
-/*
- * QPSX v095: Hand-written MIPS32 assembly GTE functions
- * These are optional replacements for C++ versions.
- * Enable via menu options (off by default).
- */
-extern int g_opt_asm_block1;   /* ASM Block 1: NCLIP (default: OFF) */
-extern int g_opt_asm_block2;   /* ASM Block 2: AVSZ3 (default: OFF) */
-
-#if defined(SF2000) || defined(__mips__)
-extern "C" {
-    void gte_NCLIP_asm(void);
-    void gte_AVSZ3_asm(void);
-}
 #endif
 
 // (This is a backported optimization from PCSX Rearmed -senquack)
@@ -229,24 +185,13 @@ extern "C" {
 #define GTE_CV(op) ((op >>  3)  & 3)
 #define GTE_LM(op) ((op >>  0)  & 1)
 
-/*
- * QPSX v088: BOUNDS and LIM with optional flag skip
- *
- * When g_opt_gte_noflags is set, overflow flag computation is skipped.
- * !!WARNING!! This can break games that rely on reading GTE flags!
- * Most 3D games don't check these flags, but some might.
- *
- * senquack note: Don't try to optimize return value to s32 like PCSX Rearmed
- * did here - it's why as of Nov. 2016, PC build has gfx glitches in 'Driver'
- */
+//senquack-Don't try to optimize return value to s32 like PCSX Rearmed did here:
+//it's why as of Nov. 2016, PC build has gfx glitches in 1st level of 'Driver'
 INLINE s64 BOUNDS(s64 n_value, s64 n_max, int n_maxflag, s64 n_min, int n_minflag) {
-	/* v088: Skip flag computation if noflags optimization enabled */
-	if (!g_opt_gte_noflags) {
-		if (n_value > n_max) {
-			gteFLAG |= n_maxflag;
-		} else if (n_value < n_min) {
-			gteFLAG |= n_minflag;
-		}
+	if (n_value > n_max) {
+		gteFLAG |= n_maxflag;
+	} else if (n_value < n_min) {
+		gteFLAG |= n_minflag;
 	}
 	return n_value;
 }
@@ -254,11 +199,10 @@ INLINE s64 BOUNDS(s64 n_value, s64 n_max, int n_maxflag, s64 n_min, int n_minfla
 INLINE s32 LIM(s32 value, s32 max, s32 min, u32 flag) {
 	s32 ret = value;
 	if (value > max) {
-		/* v088: Still clamp, but optionally skip flag */
-		if (!g_opt_gte_noflags) gteFLAG |= flag;
+		gteFLAG |= flag;
 		ret = max;
 	} else if (value < min) {
-		if (!g_opt_gte_noflags) gteFLAG |= flag;
+		gteFLAG |= flag;
 		ret = min;
 	}
 	return ret;
@@ -308,87 +252,7 @@ INLINE u32 limE(u32 result) {
 
 //senquack - n param should be unsigned (will be 'gteH' reg which is u16)
 #ifdef GTE_USE_NATIVE_DIVIDE
-
-/*
- * UNR Division Lookup Table (257 entries) - QPSX v088
- * Generated from formula: unr_table[i] = min(0, (0x40000/(i+0x100)+1)/2 - 0x101)
- * This matches the original PSX GTE hardware implementation.
- */
-static const u8 unr_table[257] = {
-    0xff, 0xfd, 0xfb, 0xf9, 0xf7, 0xf5, 0xf3, 0xf1,
-    0xef, 0xee, 0xec, 0xea, 0xe8, 0xe6, 0xe4, 0xe3,
-    0xe1, 0xdf, 0xdd, 0xdc, 0xda, 0xd8, 0xd6, 0xd5,
-    0xd3, 0xd1, 0xd0, 0xce, 0xcd, 0xcb, 0xc9, 0xc8,
-    0xc6, 0xc5, 0xc3, 0xc1, 0xc0, 0xbe, 0xbd, 0xbb,
-    0xba, 0xb8, 0xb7, 0xb5, 0xb4, 0xb2, 0xb1, 0xb0,
-    0xae, 0xad, 0xab, 0xaa, 0xa9, 0xa7, 0xa6, 0xa4,
-    0xa3, 0xa2, 0xa0, 0x9f, 0x9e, 0x9c, 0x9b, 0x9a,
-    0x99, 0x97, 0x96, 0x95, 0x94, 0x92, 0x91, 0x90,
-    0x8f, 0x8d, 0x8c, 0x8b, 0x8a, 0x89, 0x87, 0x86,
-    0x85, 0x84, 0x83, 0x82, 0x81, 0x7f, 0x7e, 0x7d,
-    0x7c, 0x7b, 0x7a, 0x79, 0x78, 0x77, 0x75, 0x74,
-    0x73, 0x72, 0x71, 0x70, 0x6f, 0x6e, 0x6d, 0x6c,
-    0x6b, 0x6a, 0x69, 0x68, 0x67, 0x66, 0x65, 0x64,
-    0x63, 0x62, 0x61, 0x60, 0x5f, 0x5e, 0x5d, 0x5d,
-    0x5c, 0x5b, 0x5a, 0x59, 0x58, 0x57, 0x56, 0x55,
-    0x54, 0x53, 0x53, 0x52, 0x51, 0x50, 0x4f, 0x4e,
-    0x4d, 0x4d, 0x4c, 0x4b, 0x4a, 0x49, 0x49, 0x48,
-    0x47, 0x46, 0x45, 0x45, 0x44, 0x43, 0x42, 0x42,
-    0x41, 0x40, 0x3f, 0x3f, 0x3e, 0x3d, 0x3c, 0x3c,
-    0x3b, 0x3a, 0x39, 0x39, 0x38, 0x37, 0x37, 0x36,
-    0x35, 0x35, 0x34, 0x33, 0x33, 0x32, 0x31, 0x31,
-    0x30, 0x2f, 0x2f, 0x2e, 0x2d, 0x2d, 0x2c, 0x2c,
-    0x2b, 0x2a, 0x2a, 0x29, 0x28, 0x28, 0x27, 0x27,
-    0x26, 0x25, 0x25, 0x24, 0x24, 0x23, 0x23, 0x22,
-    0x21, 0x21, 0x20, 0x20, 0x1f, 0x1f, 0x1e, 0x1e,
-    0x1d, 0x1d, 0x1c, 0x1c, 0x1b, 0x1a, 0x1a, 0x19,
-    0x19, 0x18, 0x18, 0x17, 0x17, 0x16, 0x16, 0x15,
-    0x15, 0x15, 0x14, 0x14, 0x13, 0x13, 0x12, 0x12,
-    0x11, 0x11, 0x10, 0x10, 0x0f, 0x0f, 0x0f, 0x0e,
-    0x0e, 0x0d, 0x0d, 0x0c, 0x0c, 0x0c, 0x0b, 0x0b,
-    0x0a, 0x0a, 0x0a, 0x09, 0x09, 0x08, 0x08, 0x08,
-    0x07  /* index 256 */
-};
-
-/*
- * UNR Division - matches PSX hardware algorithm (QPSX v088)
- * From psx-spx: https://psx-spx.consoledev.net/geometrytransformationenginegte/
- */
-INLINE u32 DIVIDE_UNR(u16 n, u16 d) {
-    if (n < d * 2) {
-        /* Count leading zeros of d (16-bit value) */
-        int z = __builtin_clz((u32)d) - 16;  /* clz for 32-bit, adjust for 16-bit */
-        u32 n_shifted = (u32)n << z;
-        u32 d_shifted = (u32)d << z;
-
-        /* Table lookup: index = (d_shifted - 0x7fc0) >> 7 */
-        u32 idx = (d_shifted - 0x7fc0) >> 7;
-        if (idx > 256) idx = 256;
-        u32 u = unr_table[idx] + 0x101;
-
-        /* Two Newton-Raphson iterations */
-        u32 d1 = ((0x2000080 - (d_shifted * u)) >> 8);
-        u32 d2 = ((0x80 + (d1 * u)) >> 8);
-
-        /* Final result */
-        u32 result = (((u64)n_shifted * d2) + 0x8000) >> 16;
-        if (result > 0x1ffff) result = 0x1ffff;
-        return result;
-    }
-    return 0x1ffff;  /* Overflow */
-}
-
 INLINE u32 DIVIDE(u16 n, u16 d) {
-	/*
-	 * QPSX v088: Optionally use UNR (Newton-Raphson) division
-	 * UNR uses lookup table + 2 multiply iterations instead of hardware DIV.
-	 * Hardware DIV on MIPS32 is ~36 cycles, UNR may be faster with good cache.
-	 * Enable with g_opt_gte_unrdiv option.
-	 */
-	if (g_opt_gte_unrdiv) {
-		return DIVIDE_UNR(n, d);
-	}
-	/* Original native divide */
 	if (n < d * 2) {
 		return ((u32)n << 16) / d;
 	}
@@ -533,7 +397,6 @@ void gteSWC2(void) {
 }
 
 void gteRTPS(void) {
-	PROFILE_START(PROF_GTE_RTPS);
 	int quotient;
 
 #ifdef GTE_LOG
@@ -564,113 +427,16 @@ void gteRTPS(void) {
 	s64 tmp = (s64)gteDQB + ((s64)gteDQA * quotient);
 	gteMAC0 = F(tmp);
 	gteIR0 = limH(tmp >> 12);
-	PROFILE_END(PROF_GTE_RTPS);
 }
 
-/*
- * QPSX v087: Optimized RTPT with loop unrolling and pre-loaded constants
- *
- * Original RTPT loops 3 times, reloading rotation matrix elements each iteration.
- * This version:
- * 1. Pre-loads rotation matrix R11-R33 and translation TRX/TRY/TRZ into locals
- * 2. Pre-loads projection constants OFX, OFY, H, DQA, DQB
- * 3. Fully unrolls the loop for 3 vertices
- * 4. Uses direct vertex access (gteVX0/1/2) instead of VX() macro
- *
- * This enables GCC to keep values in registers across all 3 vertex transforms,
- * avoiding repeated memory loads of the same constants.
- */
-#ifdef GTE_USE_FAST_RTPT
-static void gteRTPT_fast(void) {
-	int quotient;
-
-	gteFLAG = 0;
-
-	/* Pre-load rotation matrix (stays constant for all 3 vertices) */
-	const s16 r11 = gteR11, r12 = gteR12, r13 = gteR13;
-	const s16 r21 = gteR21, r22 = gteR22, r23 = gteR23;
-	const s16 r31 = gteR31, r32 = gteR32, r33 = gteR33;
-
-	/* Pre-load translation vector */
-	const s32 trx = gteTRX, try_ = gteTRY, trz = gteTRZ;
-
-	/* Pre-load projection constants */
-	const s32 ofx = gteOFX, ofy = gteOFY;
-	const u16 h = gteH;
-
-	/* SZ FIFO shift */
-	gteSZ0 = gteSZ3;
-
-	/* ========== VERTEX 0 ========== */
-	{
-		const s32 vx = gteVX0, vy = gteVY0, vz = gteVZ0;
-
-		gteMAC1 = A1((((s64)trx << 12) + (r11 * vx) + (r12 * vy) + (r13 * vz)) >> 12);
-		gteMAC2 = A2((((s64)try_ << 12) + (r21 * vx) + (r22 * vy) + (r23 * vz)) >> 12);
-		gteMAC3 = A3((((s64)trz << 12) + (r31 * vx) + (r32 * vy) + (r33 * vz)) >> 12);
-
-		gteIR1 = limB1(gteMAC1, 0);
-		gteIR2 = limB2(gteMAC2, 0);
-		gteIR3 = limB3(gteMAC3, 0);
-
-		gteSZ1 = limD(gteMAC3);
-		quotient = limE(DIVIDE(h, gteSZ1));
-
-		gteSX0 = limG1(F((s64)ofx + ((s64)gteIR1 * quotient)) >> 16);
-		gteSY0 = limG2(F((s64)ofy + ((s64)gteIR2 * quotient)) >> 16);
-	}
-
-	/* ========== VERTEX 1 ========== */
-	{
-		const s32 vx = gteVX1, vy = gteVY1, vz = gteVZ1;
-
-		gteMAC1 = A1((((s64)trx << 12) + (r11 * vx) + (r12 * vy) + (r13 * vz)) >> 12);
-		gteMAC2 = A2((((s64)try_ << 12) + (r21 * vx) + (r22 * vy) + (r23 * vz)) >> 12);
-		gteMAC3 = A3((((s64)trz << 12) + (r31 * vx) + (r32 * vy) + (r33 * vz)) >> 12);
-
-		gteIR1 = limB1(gteMAC1, 0);
-		gteIR2 = limB2(gteMAC2, 0);
-		gteIR3 = limB3(gteMAC3, 0);
-
-		gteSZ2 = limD(gteMAC3);
-		quotient = limE(DIVIDE(h, gteSZ2));
-
-		gteSX1 = limG1(F((s64)ofx + ((s64)gteIR1 * quotient)) >> 16);
-		gteSY1 = limG2(F((s64)ofy + ((s64)gteIR2 * quotient)) >> 16);
-	}
-
-	/* ========== VERTEX 2 ========== */
-	{
-		const s32 vx = gteVX2, vy = gteVY2, vz = gteVZ2;
-
-		gteMAC1 = A1((((s64)trx << 12) + (r11 * vx) + (r12 * vy) + (r13 * vz)) >> 12);
-		gteMAC2 = A2((((s64)try_ << 12) + (r21 * vx) + (r22 * vy) + (r23 * vz)) >> 12);
-		gteMAC3 = A3((((s64)trz << 12) + (r31 * vx) + (r32 * vy) + (r33 * vz)) >> 12);
-
-		gteIR1 = limB1(gteMAC1, 0);
-		gteIR2 = limB2(gteMAC2, 0);
-		gteIR3 = limB3(gteMAC3, 0);
-
-		gteSZ3 = limD(gteMAC3);
-		quotient = limE(DIVIDE(h, gteSZ3));
-
-		gteSX2 = limG1(F((s64)ofx + ((s64)gteIR1 * quotient)) >> 16);
-		gteSY2 = limG2(F((s64)ofy + ((s64)gteIR2 * quotient)) >> 16);
-	}
-
-	/* Depth cueing (only needs last quotient) */
-	const s64 tmp = (s64)gteDQB + ((s64)gteDQA * quotient);
-	gteMAC0 = F(tmp);
-	gteIR0 = limH(tmp >> 12);
-}
-#endif /* GTE_USE_FAST_RTPT */
-
-/* Original loop-based RTPT (fallback) */
-static void gteRTPT_loop(void) {
+void gteRTPT(void) {
 	int quotient;
 	int v;
 	s32 vx, vy, vz;
 
+#ifdef GTE_LOG
+	GTE_LOG("GTE RTPT\n");
+#endif
 	gteFLAG = 0;
 
 	gteSZ0 = gteSZ3;
@@ -696,27 +462,8 @@ static void gteRTPT_loop(void) {
 	gteIR0 = limH(tmp >> 12);
 }
 
-/* Public RTPT - dispatches to fast or loop version based on config */
-void gteRTPT(void) {
-	PROFILE_START(PROF_GTE_RTPT);
-#ifdef GTE_LOG
-	GTE_LOG("GTE RTPT\n");
-#endif
-
-#ifdef GTE_USE_FAST_RTPT
-	if (g_opt_rtpt_unroll) {
-		gteRTPT_fast();
-		PROFILE_END(PROF_GTE_RTPT);
-		return;
-	}
-#endif
-	gteRTPT_loop();
-	PROFILE_END(PROF_GTE_RTPT);
-}
-
 // NOTE: 'gteop' parameter is instruction opcode shifted right 10 places.
 void gteMVMVA(u32 gteop) {
-	PROFILE_START(PROF_GTE_MVMVA);
 	int shift = 12 * GTE_SF(gteop);
 	int mx = GTE_MX(gteop);
 	int v = GTE_V(gteop);
@@ -738,45 +485,23 @@ void gteMVMVA(u32 gteop) {
 	gteIR1 = limB1(gteMAC1, lm);
 	gteIR2 = limB2(gteMAC2, lm);
 	gteIR3 = limB3(gteMAC3, lm);
-	PROFILE_END(PROF_GTE_MVMVA);
 }
 
 void gteNCLIP(void) {
-	PROFILE_START(PROF_GTE_NCLIP);
 #ifdef GTE_LOG
 	GTE_LOG("GTE NCLIP\n");
 #endif
-
-#if defined(SF2000) || defined(__mips__)
-	/* QPSX v095: Use hand-written ASM if enabled */
-	if (g_opt_asm_block1) {
-		gte_NCLIP_asm();
-		PROFILE_END(PROF_GTE_NCLIP);
-		return;
-	}
-#endif
-
 	gteFLAG = 0;
 
 	gteMAC0 = F((s64)gteSX0 * (gteSY1 - gteSY2) +
 				gteSX1 * (gteSY2 - gteSY0) +
 				gteSX2 * (gteSY0 - gteSY1));
-	PROFILE_END(PROF_GTE_NCLIP);
 }
 
 void gteAVSZ3(void) {
 #ifdef GTE_LOG
 	GTE_LOG("GTE AVSZ3\n");
 #endif
-
-#if defined(SF2000) || defined(__mips__)
-	/* QPSX v095: Use hand-written ASM if enabled */
-	if (g_opt_asm_block2) {
-		gte_AVSZ3_asm();
-		return;
-	}
-#endif
-
 	gteFLAG = 0;
 
 	gteMAC0 = F((s64)gteZSF3 * (gteSZ1 + gteSZ2 + gteSZ3));

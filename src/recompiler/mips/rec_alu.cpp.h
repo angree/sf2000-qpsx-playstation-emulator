@@ -4,46 +4,6 @@
  *  MIPSREG_AT, MIPSREG_V0, MIPSREG_V1, MIPSREG_RA                            *
  *****************************************************************************/
 
-/*
- * QPSX_079: Extended Constant Propagation (IMPLEMENTED!)
- * g_opt_const_prop - when enabled, apply algebraic identity optimizations
- *
- * Standard constant propagation already tracks constants for most opcodes.
- * This extension adds SINGLE-OPERAND optimizations using algebraic identities:
- *
- *   AND with 0           → result is 0 (absorbing element)
- *   AND with 0xFFFFFFFF  → result is other operand (identity)
- *   OR  with 0           → result is other operand (identity)
- *   OR  with 0xFFFFFFFF  → result is 0xFFFFFFFF (absorbing element)
- *   XOR with 0           → result is other operand (identity)
- *   ADD with 0           → result is other operand (identity)
- *   SUB rs - 0           → result is rs (identity)
- *
- * These avoid unnecessary register loads and ALU operations.
- * Reference: https://www.geeksforgeeks.org/compiler-design/peephole-optimization-in-compiler-design/
- */
-extern int g_opt_const_prop;
-
-/*
- * QPSX_114/115: Native Mode - MIPS I to MIPS32 direct execution
- *
- * Since MIPS I and MIPS32 are binary compatible for ALU/shift/imm instructions,
- * we can skip some overhead in FAST mode:
- *   - Skip extended const prop checks (algebraic identities)
- *   - Just emit the instruction with minimal overhead
- *
- * v115 adds SEMI mode inspired by Sony POPS (PSP PS1 emulator):
- *   - POPS runs PSX code "semi-natively" on PSP's compatible MIPS CPU
- *   - Uses "code analyzer" to identify what can run directly vs needs handling
- *   - SEMI mode tracks "pure ALU blocks" that could run almost directly
- *
- * 0 = OFF (normal dynarec path)
- * 1 = STATS (count native-capable vs emulated instructions)
- * 2 = FAST (skip extended const prop for simple ALU - reduces overhead)
- * 3 = SEMI (POPS-style: skip ALL const prop for ALU, tracks pure blocks)
- */
-extern int g_opt_native_mode;
-
 /***********************************************
  * Options that can be disabled for debugging: *
  ***********************************************/
@@ -245,66 +205,8 @@ static void recADDU()
 {
 	// rd = rs + rt
 
-	if (!_Rd_) return;
-
 	const bool rs_const = IsConst(_Rs_);
 	const bool rt_const = IsConst(_Rt_);
-
-	/* v114: FAST mode - skip extended const prop for simpler codegen
-	 * The instruction is binary-compatible, just emit it directly
-	 * with minimal register management overhead.
-	 *
-	 * v115: SEMI mode - skip ALL const prop, absolute minimum overhead
-	 * POPS-inspired: treat these as near-direct execution candidates
-	 */
-	if (g_opt_native_mode >= 2) {
-		/* FAST/SEMI: skip algebraic identity checks */
-		if (g_opt_native_mode == 3) {
-			/* SEMI: Skip ALL const tracking - near-native path */
-			SetUndef(_Rd_);
-			REC_RTYPE_RD_RS_RT(ADDU, _Rd_, _Rs_, _Rt_);
-		} else {
-			/* FAST: still track consts but skip extended checks */
-			const bool set_const = rs_const && rt_const;
-			REC_RTYPE_RD_RS_RT(ADDU, _Rd_, _Rs_, _Rt_);
-			if (set_const)
-				SetConst(_Rd_, GetConst(_Rs_) + GetConst(_Rt_));
-		}
-		return;
-	}
-
-	// Extended const prop: ADD with 0 → identity
-	if (g_opt_const_prop && (rs_const || rt_const)) {
-		u32 rs_val = rs_const ? GetConst(_Rs_) : 0;
-		u32 rt_val = rt_const ? GetConst(_Rt_) : 0;
-
-		// ADD with 0 → result is other operand (identity)
-		if (rs_const && rs_val == 0) {
-			// Result is rt
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
-			if (rd != rt) OR(rd, rt, 0);  // MIPS move: rd = rt | 0 = rt
-			if (rt_const) SetConst(_Rd_, rt_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rt);
-			return;
-		}
-		if (rt_const && rt_val == 0) {
-			// Result is rs
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
-			if (rd != rs) OR(rd, rs, 0);  // MIPS move: rd = rs | 0 = rs
-			if (rs_const) SetConst(_Rd_, rs_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rs);
-			return;
-		}
-	}
-
 	const bool set_const = rs_const && rt_const;
 
 	//  When an ADDU adds an unknown val to a known-const val:
@@ -354,46 +256,7 @@ static void recSUBU()
 {
 	// rd = rs - rt
 
-	if (!_Rd_) return;
-
-	const bool rs_const = IsConst(_Rs_);
-	const bool rt_const = IsConst(_Rt_);
-
-	/* v114/v115: FAST/SEMI mode - skip extended const prop */
-	if (g_opt_native_mode >= 2) {
-		if (g_opt_native_mode == 3) {
-			/* SEMI: Skip ALL const tracking - near-native path */
-			SetUndef(_Rd_);
-			REC_RTYPE_RD_RS_RT(SUBU, _Rd_, _Rs_, _Rt_);
-		} else {
-			const bool set_const = rs_const && rt_const;
-			REC_RTYPE_RD_RS_RT(SUBU, _Rd_, _Rs_, _Rt_);
-			if (set_const)
-				SetConst(_Rd_, GetConst(_Rs_) - GetConst(_Rt_));
-		}
-		return;
-	}
-
-	// Extended const prop: SUB with 0 in rt → identity
-	if (g_opt_const_prop && rt_const) {
-		u32 rt_val = GetConst(_Rt_);
-
-		// SUB x - 0 → result is x (identity)
-		if (rt_val == 0) {
-			// Result is rs
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
-			if (rd != rs) OR(rd, rs, 0);  // MIPS move: rd = rs | 0 = rs
-			if (rs_const) SetConst(_Rd_, GetConst(_Rs_));
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rs);
-			return;
-		}
-	}
-
-	const bool set_const = rs_const && rt_const;
+	const bool set_const = IsConst(_Rs_) && IsConst(_Rt_);
 
 	REC_RTYPE_RD_RS_RT(SUBU, _Rd_, _Rs_, _Rt_);
 
@@ -406,71 +269,7 @@ static void recAND()
 {
 	// rd = rs & rt
 
-	if (!_Rd_) return;
-
-	const bool rs_const = IsConst(_Rs_);
-	const bool rt_const = IsConst(_Rt_);
-
-	/* v114/v115: FAST/SEMI mode - skip extended const prop */
-	if (g_opt_native_mode >= 2) {
-		if (g_opt_native_mode == 3) {
-			/* SEMI: Skip ALL const tracking - near-native path */
-			SetUndef(_Rd_);
-			REC_RTYPE_RD_RS_RT(AND, _Rd_, _Rs_, _Rt_);
-		} else {
-			const bool set_const = rs_const && rt_const;
-			REC_RTYPE_RD_RS_RT(AND, _Rd_, _Rs_, _Rt_);
-			if (set_const)
-				SetConst(_Rd_, GetConst(_Rs_) & GetConst(_Rt_));
-		}
-		return;
-	}
-
-	// Extended const prop: algebraic identity optimizations
-	if (g_opt_const_prop && (rs_const || rt_const)) {
-		u32 rs_val = rs_const ? GetConst(_Rs_) : 0;
-		u32 rt_val = rt_const ? GetConst(_Rt_) : 0;
-
-		// AND with 0 → result is 0 (absorbing element)
-		if ((rs_const && rs_val == 0) || (rt_const && rt_val == 0)) {
-			// Result is constant 0
-			SetConst(_Rd_, 0);
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			XOR(rd, rd, rd);  // rd = 0
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			return;
-		}
-
-		// AND with 0xFFFFFFFF → result is other operand (identity)
-		if (rs_const && rs_val == 0xFFFFFFFF) {
-			// Result is rt
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
-			if (rd != rt) OR(rd, rt, 0);  // MIPS move
-			if (rt_const) SetConst(_Rd_, rt_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rt);
-			return;
-		}
-		if (rt_const && rt_val == 0xFFFFFFFF) {
-			// Result is rs
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
-			if (rd != rs) OR(rd, rs, 0);  // MIPS move
-			if (rs_const) SetConst(_Rd_, rs_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rs);
-			return;
-		}
-	}
-
-	// Standard path
-	const bool set_const = rs_const && rt_const;
+	const bool set_const = IsConst(_Rs_) && IsConst(_Rt_);
 
 	REC_RTYPE_RD_RS_RT(AND, _Rd_, _Rs_, _Rt_);
 
@@ -482,71 +281,7 @@ static void recOR()
 {
 	// rd = rs | rt
 
-	if (!_Rd_) return;
-
-	const bool rs_const = IsConst(_Rs_);
-	const bool rt_const = IsConst(_Rt_);
-
-	/* v114/v115: FAST/SEMI mode - skip extended const prop */
-	if (g_opt_native_mode >= 2) {
-		if (g_opt_native_mode == 3) {
-			/* SEMI: Skip ALL const tracking - near-native path */
-			SetUndef(_Rd_);
-			REC_RTYPE_RD_RS_RT(OR, _Rd_, _Rs_, _Rt_);
-		} else {
-			const bool set_const = rs_const && rt_const;
-			REC_RTYPE_RD_RS_RT(OR, _Rd_, _Rs_, _Rt_);
-			if (set_const)
-				SetConst(_Rd_, GetConst(_Rs_) | GetConst(_Rt_));
-		}
-		return;
-	}
-
-	// Extended const prop: algebraic identity optimizations
-	if (g_opt_const_prop && (rs_const || rt_const)) {
-		u32 rs_val = rs_const ? GetConst(_Rs_) : 0;
-		u32 rt_val = rt_const ? GetConst(_Rt_) : 0;
-
-		// OR with 0xFFFFFFFF → result is 0xFFFFFFFF (absorbing element)
-		if ((rs_const && rs_val == 0xFFFFFFFF) || (rt_const && rt_val == 0xFFFFFFFF)) {
-			// Result is constant 0xFFFFFFFF
-			SetConst(_Rd_, 0xFFFFFFFF);
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			NOR(rd, 0, 0);  // rd = ~(0 | 0) = 0xFFFFFFFF
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			return;
-		}
-
-		// OR with 0 → result is other operand (identity)
-		if (rs_const && rs_val == 0) {
-			// Result is rt
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
-			if (rd != rt) OR(rd, rt, 0);  // MIPS move
-			if (rt_const) SetConst(_Rd_, rt_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rt);
-			return;
-		}
-		if (rt_const && rt_val == 0) {
-			// Result is rs
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
-			if (rd != rs) OR(rd, rs, 0);  // MIPS move
-			if (rs_const) SetConst(_Rd_, rs_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rs);
-			return;
-		}
-	}
-
-	// Standard path
-	const bool set_const = rs_const && rt_const;
+	const bool set_const = IsConst(_Rs_) && IsConst(_Rt_);
 
 	REC_RTYPE_RD_RS_RT(OR,  _Rd_, _Rs_, _Rt_);
 
@@ -558,86 +293,7 @@ static void recXOR()
 {
 	// rd = rs ^ rt
 
-	if (!_Rd_) return;
-
-	const bool rs_const = IsConst(_Rs_);
-	const bool rt_const = IsConst(_Rt_);
-
-	/* v114/v115: FAST/SEMI mode - skip extended const prop */
-	if (g_opt_native_mode >= 2) {
-		if (g_opt_native_mode == 3) {
-			/* SEMI: Skip ALL const tracking - near-native path */
-			SetUndef(_Rd_);
-			REC_RTYPE_RD_RS_RT(XOR, _Rd_, _Rs_, _Rt_);
-		} else {
-			const bool set_const = rs_const && rt_const;
-			REC_RTYPE_RD_RS_RT(XOR, _Rd_, _Rs_, _Rt_);
-			if (set_const)
-				SetConst(_Rd_, GetConst(_Rs_) ^ GetConst(_Rt_));
-		}
-		return;
-	}
-
-	// Extended const prop: algebraic identity optimizations
-	if (g_opt_const_prop && (rs_const || rt_const)) {
-		u32 rs_val = rs_const ? GetConst(_Rs_) : 0;
-		u32 rt_val = rt_const ? GetConst(_Rt_) : 0;
-
-		// XOR with 0 → result is other operand (identity)
-		if (rs_const && rs_val == 0) {
-			// Result is rt
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
-			if (rd != rt) OR(rd, rt, 0);  // MIPS move
-			if (rt_const) SetConst(_Rd_, rt_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rt);
-			return;
-		}
-		if (rt_const && rt_val == 0) {
-			// Result is rs
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
-			if (rd != rs) OR(rd, rs, 0);  // MIPS move
-			if (rs_const) SetConst(_Rd_, rs_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rs);
-			return;
-		}
-
-		// XOR with 0xFFFFFFFF → result is bitwise NOT of other operand
-		if (rs_const && rs_val == 0xFFFFFFFF) {
-			// Result is ~rt
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
-			NOR(rd, rt, 0);  // rd = ~(rt | 0) = ~rt
-			if (rt_const) SetConst(_Rd_, ~rt_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rt);
-			return;
-		}
-		if (rt_const && rt_val == 0xFFFFFFFF) {
-			// Result is ~rs
-			u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
-			u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
-			NOR(rd, rs, 0);  // rd = ~(rs | 0) = ~rs
-			if (rs_const) SetConst(_Rd_, ~rs_val);
-			else SetUndef(_Rd_);
-			regMipsChanged(_Rd_);
-			regUnlock(rd);
-			regUnlock(rs);
-			return;
-		}
-	}
-
-	// Standard path
-	const bool set_const = rs_const && rt_const;
+	const bool set_const = IsConst(_Rs_) && IsConst(_Rt_);
 
 	REC_RTYPE_RD_RS_RT(XOR, _Rd_, _Rs_, _Rt_);
 

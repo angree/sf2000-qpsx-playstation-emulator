@@ -39,6 +39,17 @@
 #include "psxdma.h"
 #include "psxevents.h"
 
+/*
+ * v367: CDDA Mode system - 3 modes for different use cases
+ * CDDA_OFF (0)     - Completely disabled, no timing/interrupts
+ * CDDA_PRETEND (1) - Timing works (games progress), no audio
+ * CDDA_ON (2)      - Full audio with ADPCM/WAV support
+ */
+#define CDDA_OFF     0
+#define CDDA_PRETEND 1
+#define CDDA_ON      2
+extern int qpsx_cdda_mode;  /* Set from libretro-core.cpp */
+
 #if defined(CDR_LOG) || defined(CDR_LOG_I) || defined(CDR_LOG_IO)
 static const char *CmdName[0x100]= {
     "CdlSync",     "CdlNop",       "CdlSetloc",  "CdlPlay",
@@ -523,6 +534,9 @@ static void cdrPlayInterrupt_Autopause()
 // also handles seek
 void cdrPlayInterrupt()
 {
+	/* v367: CDDA modes handled in audio section below
+	 * Timing MUST continue for all modes (games depend on it) */
+
 	if (cdr.Seeked == SEEK_PENDING) {
 		if (cdr.Stat) {
 			CDR_LOG_I("cdrom: seek stat hack\n");
@@ -577,6 +591,7 @@ void cdrPlayInterrupt()
 	 * Batch is invalidated on seek (position mismatch).
 	 */
 #define CDDA_BATCH_SIZE 32
+	/* v367: Only mix audio if CDDA_ON mode - Config.Cdda synced with qpsx_cdda_mode */
 	if (!Config.Cdda && !cdr.Muted) {
 		static unsigned char cdda_batch[CD_FRAMESIZE_RAW * CDDA_BATCH_SIZE];
 		static int cdda_batch_pos = CDDA_BATCH_SIZE;  /* Force initial read */
@@ -620,6 +635,7 @@ void cdrPlayInterrupt()
 		}
 	}
 
+	/* v355: REVERTED - always schedule (games depend on timing even with CDDA off) */
 	CDRMISC_INT(cdReadTime);
 
 	// update for CdlGetlocP/autopause

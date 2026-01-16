@@ -4,9 +4,30 @@ PlayStation 1 (PSX) emulator for Data Frog SF2000 and GB300 handheld devices.
 
 Based on PCSX4ALL with MIPS-to-MIPS dynamic recompiler, ported to the SF2000/GB300 multicore framework.
 
-**Current Status: Early Alpha** - Many games are playable but performance varies significantly.
+**Current Version: v374** - Significant performance improvements over previous releases.
 
-**Current CDDA Compression Status: Broken. Keep your orignal .bin audio files. Fix coming soon.**
+## Changelog v374
+
+### Major Performance Improvements
+- **~30% faster** than previous public release
+- Removed PORK (profiler overhead) - significantly improved frame rates
+- Cleaner audio callback with zero unnecessary overhead
+
+### New Features
+- **Slow Motion Mode** - adjustable target speed (40-100%) for difficult game sections
+- **Joypad Remapping** - full button remapping support for games requiring L2/R2 (Abe's Oddysee, racing games, etc.)
+- **CDDA Pretend Mode** - keeps games running that require CD audio detection without actual audio playback
+- **Player 2 Support** - optional second controller input
+
+### Audio Fixes
+- Fixed CDDA ADPCM decoding - proper playback of pre-converted audio tracks
+- Fixed "No CDDA" crashes - games no longer hang when CD audio is missing
+- Improved XA audio synchronization
+
+### Other Improvements
+- HLE BIOS is now default (faster startup, better compatibility)
+- Cycle adjustment with configurable step size (1/8/32/128)
+- Better menu organization
 
 ## Downloads
 

@@ -44,6 +44,15 @@
 /* v140 DEBUG: xlog for debug logging */
 extern "C" void xlog(const char *fmt, ...);
 
+/* v335: Target speed - imported from libretro-core.cpp */
+extern int g_target_speed;  /* 40-100%, 100 = normal speed */
+
+/* v336 FIX: Scaled cycle values for target speed support
+ * These are updated by psxRcntReinitTiming() when target_speed changes
+ * Default = 100% speed (original hardcoded values) */
+static u32 scaled_pal_cycles = 8864320;    /* PAL: clk/50/313 in 20.12 fixed-point */
+static u32 scaled_ntsc_cycles = 8791293;   /* NTSC: clk/60/263 in 20.12 fixed-point */
+
 /******************************************************************************/
 
 enum
@@ -362,15 +371,6 @@ void psxRcntUpdate()
             // NOTE: this is point of control transfer to frontend menu
             EmuUpdate();
 
-            /* v140 DEBUG: Log after EmuUpdate returns */
-            {
-                static int emu_return_count = 0;
-                if (emu_return_count < 10) {
-                    xlog("RCNT: EmuUpdate returned #%d, cycle=%u", emu_return_count, cycle);
-                    emu_return_count++;
-                }
-            }
-
             // If frontend called LoadState(), loading a savestate, do not
             //  proceed further: Rootcounter state has been altered.
             if (rcntFreezeLoaded) {
@@ -411,10 +411,10 @@ void psxRcntUpdate()
         rcnts[3].cycleStart = cycle - leftover_cycles;
         if (Config.PsxType)
                 // 20.12 precision, clk / 50 / 313 ~= 2164.14
-                base_cycle += hsync_steps * 8864320;
+                base_cycle += hsync_steps * scaled_pal_cycles;  /* v336: was 8864320 */
         else
                 // clk / 60 / 263 ~= 2146.31
-                base_cycle += hsync_steps * 8791293;
+                base_cycle += hsync_steps * scaled_ntsc_cycles;  /* v336: was 8791293 */
         rcnts[3].cycle = base_cycle >> 12;
         base_cycle &= 0xfff;
     }
@@ -525,6 +525,54 @@ void psxRcntInit(void)
     hsync_steps = 1;
 
     psxRcntSet();
+}
+
+/******************************************************************************/
+/* QPSX_277: Reinitialize rcnts[3] timing after region detection
+ *
+ * BUG FIX: psxRcntInit() is called in psxReset() BEFORE CheckCdrom() detects
+ * the game region. This means rcnts[3].target is initialized with the DEFAULT
+ * Config.PsxType (NTSC), not the actual game region.
+ *
+ * This function should be called AFTER CheckCdrom() to fix the timing for the
+ * detected region (PAL vs NTSC).
+ */
+void psxRcntReinitTiming(void)
+{
+    extern void xlog(const char *fmt, ...);
+
+    u32 old_target = rcnts[3].target;
+    u32 new_target = (PSXCLK / (FrameRate[Config.PsxType] * HSyncTotal[Config.PsxType]));
+
+    /*
+     * v349: REMOVED VSync timing scaling - IT DOES NOT WORK!
+     *
+     * Problem: scaling scaled_pal_cycles changed WHEN VSync occurs,
+     * but the emulator still emulated the SAME amount of work between VSyncs.
+     * Result: fps dropped proportionally (80% target = 80% fps).
+     *
+     * Real fix: Throttling in retro_run() - skip some Execute() calls.
+     * This actually reduces work done per second.
+     *
+     * Keep scaled_*_cycles at 100% (normal timing), throttling handles speed.
+     */
+    scaled_pal_cycles = 8864320;    /* Always 100% - no scaling */
+    scaled_ntsc_cycles = 8791293;   /* Always 100% - no scaling */
+    xlog("RCNT_349: VSync timing at 100%% (throttling in retro_run handles target_speed=%d%%)",
+         g_target_speed);
+
+    xlog("RCNT_FIX: psxRcntReinitTiming() PsxType=%d (%s)",
+         Config.PsxType, Config.PsxType == PSX_TYPE_PAL ? "PAL" : "NTSC");
+    xlog("RCNT_FIX: rcnts[3].target: old=%u new=%u", old_target, new_target);
+
+    if (old_target != new_target) {
+        xlog("RCNT_FIX: TIMING WAS WRONG! Fixing...");
+        rcnts[3].target = new_target;
+        rcnts[3].cycle = new_target * rcnts[3].rate;
+        _psxRcntWcount(3, 0);
+        psxRcntSet();
+        xlog("RCNT_FIX: Fixed! rcnts[3].cycle=%u", rcnts[3].cycle);
+    }
 }
 
 /******************************************************************************/

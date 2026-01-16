@@ -4,26 +4,6 @@
  *  MIPSREG_AT, MIPSREG_V0, MIPSREG_V1, MIPSREG_RA                            *
  *****************************************************************************/
 
-/*
- * QPSX_079: LO/HI Register Caching Optimization (IMPLEMENTED!)
- *
- * QPSX_079 FIX: Added lohi_cache_valid = false in DIV/DIVU const paths.
- * Previously, const optimization paths wrote to memory but didn't invalidate
- * the cache, causing MFLO/MFHI to return stale values from prior MULT.
- *
- * When g_opt_lohi_cache is enabled:
- *   - MULT/MULTU/DIV/DIVU: Keep results in native $lo/$hi, skip SW to memory
- *   - MFLO/MFHI: Use native MFLO/MFHI if cache valid, else LW from memory
- *   - Cache is invalidated by: regClearJump, regClearBranch, before JAL
- *
- * This optimization reduces memory traffic for common MULT->MFLO sequences.
- * Existing USE_3OP_MUL_OPTIMIZATIONS handles many cases already, so this
- * mainly helps when 3-op MUL optimization fails (e.g., HI is also used).
- *
- * State variables (g_opt_lohi_cache, lohi_cache_valid, flushLoHiCache)
- * are defined in regcache.h for proper include ordering.
- */
-
 /***********************************************
  * Options that can be disabled for debugging: *
  ***********************************************/
@@ -109,8 +89,7 @@ static void recMULT()
 
 			regUnlock(ident_reg);
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else {
 			// If one of the operands is a const power-of-two, we can get result by shifting
@@ -142,8 +121,7 @@ static void recMULT()
 
 				regUnlock(npot_reg);
 
-				// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-				lohi_cache_valid = false;
+				// We're done
 				return;
 			}
 		}
@@ -163,8 +141,7 @@ static void recMULT()
 				SW(0, PERM_REG_1, offGPR(33)); // HI
 			}
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		}
 
@@ -176,8 +153,6 @@ static void recMULT()
 	if (convertMultiplyTo3Op()) {
 		// MULT/MULTU was converted to modern 3-op MUL.
 		// Furthermore, no code will be emitted for next MFLO.
-		// LO/HI cache invalid - we didn't touch native $lo/$hi
-		lohi_cache_valid = false;
 		return;
 	}
 #endif
@@ -186,23 +161,10 @@ static void recMULT()
 	u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
 
 	MULT(rs, rt);
-
-	/*
-	 * QPSX_082 FIX: If in branch delay slot, must write to memory!
-	 * When a block ends after the delay slot, the new block at branch target
-	 * will reset lohi_cache_valid and read from memory. If we only kept
-	 * the result in native $lo/$hi, it would be lost.
-	 */
-	if (g_opt_lohi_cache && !branch) {
-		// LO/HI caching: keep results in native $lo/$hi, mark cache valid
-		lohi_cache_valid = true;
-	} else {
-		// Standard path: spill to memory immediately
-		MFLO(TEMP_1);
-		MFHI(TEMP_2);
-		SW(TEMP_1, PERM_REG_1, offGPR(32)); // LO
-		SW(TEMP_2, PERM_REG_1, offGPR(33)); // HI
-	}
+	MFLO(TEMP_1);
+	MFHI(TEMP_2);
+	SW(TEMP_1, PERM_REG_1, offGPR(32)); // LO
+	SW(TEMP_2, PERM_REG_1, offGPR(33)); // HI
 
 	regUnlock(rs);
 	regUnlock(rt);
@@ -249,8 +211,7 @@ static void recMULTU()
 
 			regUnlock(ident_reg);
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else {
 			// If one of the operands is a const power-of-two, we can get result by shifting
@@ -274,8 +235,7 @@ static void recMULTU()
 
 				regUnlock(npot_reg);
 
-				// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-				lohi_cache_valid = false;
+				// We're done
 				return;
 			}
 		}
@@ -295,8 +255,7 @@ static void recMULTU()
 				SW(0, PERM_REG_1, offGPR(33)); // HI
 			}
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		}
 
@@ -308,8 +267,6 @@ static void recMULTU()
 	if (convertMultiplyTo3Op()) {
 		// MULT/MULTU was converted to modern 3-op MUL.
 		// Furthermore, no code will be emitted for next MFLO.
-		// LO/HI cache invalid - we didn't touch native $lo/$hi
-		lohi_cache_valid = false;
 		return;
 	}
 #endif
@@ -318,21 +275,10 @@ static void recMULTU()
 	u32 rt = regMipsToHost(_Rt_, REG_LOAD, REG_REGISTER);
 
 	MULTU(rs, rt);
-
-	/*
-	 * QPSX_082 FIX: If in branch delay slot, must write to memory!
-	 * See comment in recMULT() for full explanation.
-	 */
-	if (g_opt_lohi_cache && !branch) {
-		// LO/HI caching: keep results in native $lo/$hi, mark cache valid
-		lohi_cache_valid = true;
-	} else {
-		// Standard path: spill to memory immediately
-		MFLO(TEMP_1);
-		MFHI(TEMP_2);
-		SW(TEMP_1, PERM_REG_1, offGPR(32)); // LO
-		SW(TEMP_2, PERM_REG_1, offGPR(33)); // HI
-	}
+	MFLO(TEMP_1);
+	MFHI(TEMP_2);
+	SW(TEMP_1, PERM_REG_1, offGPR(32)); // LO
+	SW(TEMP_2, PERM_REG_1, offGPR(33)); // HI
 
 	regUnlock(rs);
 	regUnlock(rt);
@@ -369,8 +315,7 @@ static void recDIV()
 
 			regUnlock(rs);
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else if (rt_val == 1) {
 			// If divisor is const-val '1', result is identity
@@ -381,8 +326,7 @@ static void recDIV()
 
 			regUnlock(rs);
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else if (rs_const) {
 			// If both operands are known-const, compute result statically
@@ -403,8 +347,7 @@ static void recDIV()
 				SW(0, PERM_REG_1, offGPR(33)); // HI
 			}
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else {
 			// If divisor is a const power-of-two, we can get result by shifting
@@ -439,8 +382,7 @@ static void recDIV()
 
 				regUnlock(rs);
 
-				// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-				lohi_cache_valid = false;
+				// We're done
 				return;
 			}
 		}
@@ -485,26 +427,13 @@ static void recDIV()
 
 	if (omit_div_by_zero_fixup) {
 		DIV(rs, rt);
-
-		/*
-		 * QPSX_082 FIX: If in branch delay slot, must write to memory!
-		 * See comment in recMULT() for full explanation.
-		 */
-		if (g_opt_lohi_cache && !branch) {
-			// LO/HI caching: keep results in native $lo/$hi
-			lohi_cache_valid = true;
-			regUnlock(rs);
-			regUnlock(rt);
-			return;
-		}
-
-		MFLO(TEMP_1);
+		MFLO(TEMP_1);              // NOTE: Hi/Lo can't be cached for now, so spill them
 		MFHI(TEMP_2);
 	} else {
 		DIV(rs, rt);
 		ADDIU(MIPSREG_A1, 0, -1);
 		SLT(TEMP_3, rs, 0);        // TEMP_3 = (rs < 0 ? 1 : 0)
-		MFLO(TEMP_1);              // Must spill - fixup code modifies results
+		MFLO(TEMP_1);              // NOTE: Hi/Lo can't be cached for now, so spill them
 		MFHI(TEMP_2);
 
 		// If divisor was 0, set LO result (quotient) to 1 if dividend was < 0
@@ -517,9 +446,6 @@ static void recDIV()
 		// If divisor was 0, set HI result (remainder) to rs
 		MOVZ(TEMP_2, rs, rt);
 #endif
-
-		// Invalidate cache - we modified TEMP_1/TEMP_2 after MFLO/MFHI
-		lohi_cache_valid = false;
 	}
 
 	SW(TEMP_1, PERM_REG_1, offGPR(32));
@@ -557,8 +483,7 @@ static void recDIVU()
 
 			regUnlock(rs);
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else if (rt_val == 1) {
 			// If divisor is const-val '1', result is identity
@@ -569,8 +494,7 @@ static void recDIVU()
 
 			regUnlock(rs);
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else if (rs_const) {
 			// If both operands are known-const, compute result statically
@@ -591,8 +515,7 @@ static void recDIVU()
 				SW(0, PERM_REG_1, offGPR(33)); // HI
 			}
 
-			// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-			lohi_cache_valid = false;
+			// We're done
 			return;
 		} else {
 			// If divisor is a const power-of-two, we can get result by shifting
@@ -619,8 +542,7 @@ static void recDIVU()
 
 				regUnlock(rs);
 
-				// LO/HI cache invalid - we wrote to memory, not native $lo/$hi
-				lohi_cache_valid = false;
+				// We're done
 				return;
 			}
 		}
@@ -652,25 +574,12 @@ static void recDIVU()
 
 	if (omit_div_by_zero_fixup) {
 		DIVU(rs, rt);
-
-		/*
-		 * QPSX_082 FIX: If in branch delay slot, must write to memory!
-		 * See comment in recMULT() for full explanation.
-		 */
-		if (g_opt_lohi_cache && !branch) {
-			// LO/HI caching: keep results in native $lo/$hi
-			lohi_cache_valid = true;
-			regUnlock(rs);
-			regUnlock(rt);
-			return;
-		}
-
-		MFLO(TEMP_1);
+		MFLO(TEMP_1);              // NOTE: Hi/Lo can't be cached for now, so spill them
 		MFHI(TEMP_2);
 	} else {
 		DIVU(rs, rt);
 		ADDIU(TEMP_3, 0, -1);
-		MFLO(TEMP_1);              // Must spill - fixup code modifies results
+		MFLO(TEMP_1);              // NOTE: Hi/Lo can't be cached for now, so spill them
 		MFHI(TEMP_2);
 
 		// If divisor was 0, set LO result (quotient) to 0xffff_ffff
@@ -680,9 +589,6 @@ static void recDIVU()
 		// If divisor was 0, set HI result (remainder) to rs
 		MOVZ(TEMP_2, rs, rt);
 #endif
-
-		// Invalidate cache - we modified TEMP_1/TEMP_2 after MFLO/MFHI
-		lohi_cache_valid = false;
 	}
 
 	SW(TEMP_1, PERM_REG_1, offGPR(32));
@@ -698,14 +604,7 @@ static void recMFHI()
 	SetUndef(_Rd_);
 	u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
 
-	if (g_opt_lohi_cache && lohi_cache_valid) {
-		// LO/HI are in native regs - use MFHI directly
-		MFHI(rd);
-	} else {
-		// Load from memory
-		LW(rd, PERM_REG_1, offGPR(33));
-	}
-
+	LW(rd, PERM_REG_1, offGPR(33));
 	regMipsChanged(_Rd_);
 	regUnlock(rd);
 }
@@ -713,9 +612,6 @@ static void recMFHI()
 static void recMTHI()
 {
 // Hi = Rs
-	// MTHI invalidates cache - native $hi will be overwritten
-	lohi_cache_valid = false;
-
 	u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
 	SW(rs, PERM_REG_1, offGPR(33));
 	regUnlock(rs);
@@ -731,7 +627,6 @@ static void recMFLO()
 		// A prior MULT/MULTU was converted to 3-op MUL. We emit nothing
 		//  for this MFLO.
 		skip_emitting_next_mflo = false;
-		lohi_cache_valid = false;  // 3-op MUL invalidates native $lo/$hi
 		return;
 	}
 #endif
@@ -741,14 +636,7 @@ static void recMFLO()
 	SetUndef(_Rd_);
 	u32 rd = regMipsToHost(_Rd_, REG_FIND, REG_REGISTER);
 
-	if (g_opt_lohi_cache && lohi_cache_valid) {
-		// LO/HI are in native regs - use MFLO directly
-		MFLO(rd);
-	} else {
-		// Load from memory
-		LW(rd, PERM_REG_1, offGPR(32));
-	}
-
+	LW(rd, PERM_REG_1, offGPR(32));
 	regMipsChanged(_Rd_);
 	regUnlock(rd);
 }
@@ -757,9 +645,6 @@ static void recMFLO()
 static void recMTLO()
 {
 // Lo = Rs
-	// MTLO invalidates cache - native $lo will be overwritten
-	lohi_cache_valid = false;
-
 	u32 rs = regMipsToHost(_Rs_, REG_LOAD, REG_REGISTER);
 	SW(rs, PERM_REG_1, offGPR(32));
 	regUnlock(rs);

@@ -176,6 +176,8 @@ typedef struct {
 
 	void *reserved;
 	int writeok;
+	u32 chain_budget;    /* v304: Chain budget for safe block chaining */
+	s32 cycles_until_event;  /* v320: Cycles until next event (for POPS-style chaining) */
 } psxRegisters;
 
 extern psxRegisters psxRegs;

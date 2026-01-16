@@ -38,6 +38,11 @@ struct gpu_unai_config_t {
 	                          //  Normally 0. Value '1' will skip rendering
 	                          //  odd lines.
 
+	uint8_t pixel_size:2;     // v346: Pixel doubling mode for vout_port ONLY
+	                          //  0=1x1 (normal), 1=2x1 (line double),
+	                          //  2=2x2 (pixel double). Separate from ilace_force
+	                          //  to prevent GPU line skipping bug.
+
 	uint8_t lighting:1;
 	uint8_t fast_lighting:1;
 	uint8_t blending:1;

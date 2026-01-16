@@ -161,4 +161,126 @@ gte_AVSZ3_asm:
 .end gte_AVSZ3_asm
 
 
+/***************************************************************************
+ * v294: RTPT ASM - Transform 3 Vertices (Perspective Transform)
+ *
+ * This is a NO-FLAGS version - skips overflow checking for speed.
+ * May cause visual glitches in some games that rely on GTE flags.
+ *
+ * For now this is a STUB that calls the C version.
+ * TODO: Implement full ASM version for maximum performance.
+ ***************************************************************************/
+
+/* Additional offsets for RTPT */
+#define OFF_VXY0        (OFF_CP2D + 0*4)        /* 264: VX0=lo, VY0=hi */
+#define OFF_VZ0         (OFF_CP2D + 1*4)        /* 268: VZ0=lo */
+#define OFF_VXY1        (OFF_CP2D + 2*4)        /* 272 */
+#define OFF_VZ1         (OFF_CP2D + 3*4)        /* 276 */
+#define OFF_VXY2        (OFF_CP2D + 4*4)        /* 280 */
+#define OFF_VZ2         (OFF_CP2D + 5*4)        /* 284 */
+#define OFF_IR0         (OFF_CP2D + 8*4)        /* 296 */
+#define OFF_IR1         (OFF_CP2D + 9*4)        /* 300 */
+#define OFF_IR2         (OFF_CP2D + 10*4)       /* 304 */
+#define OFF_IR3         (OFF_CP2D + 11*4)       /* 308 */
+#define OFF_SZ0         (OFF_CP2D + 16*4)       /* 328 */
+#define OFF_MAC1        (OFF_CP2D + 25*4)       /* 364 */
+#define OFF_MAC2        (OFF_CP2D + 26*4)       /* 368 */
+#define OFF_MAC3        (OFF_CP2D + 27*4)       /* 372 */
+
+/* CP2C offsets for rotation matrix and translation */
+#define OFF_R11R12      (OFF_CP2C + 0*4)        /* 392: R11=lo, R12=hi */
+#define OFF_R13R21      (OFF_CP2C + 1*4)        /* 396 */
+#define OFF_R22R23      (OFF_CP2C + 2*4)        /* 400 */
+#define OFF_R31R32      (OFF_CP2C + 3*4)        /* 404 */
+#define OFF_R33         (OFF_CP2C + 4*4)        /* 408 */
+#define OFF_TRX         (OFF_CP2C + 5*4)        /* 412 */
+#define OFF_TRY         (OFF_CP2C + 6*4)        /* 416 */
+#define OFF_TRZ         (OFF_CP2C + 7*4)        /* 420 */
+#define OFF_OFX         (OFF_CP2C + 24*4)       /* 488 */
+#define OFF_OFY         (OFF_CP2C + 25*4)       /* 492 */
+#define OFF_H           (OFF_CP2C + 26*4)       /* 496 */
+#define OFF_DQA         (OFF_CP2C + 27*4)       /* 500 */
+#define OFF_DQB         (OFF_CP2C + 28*4)       /* 504 */
+
+.globl gte_RTPT_asm
+.ent gte_RTPT_asm
+gte_RTPT_asm:
+    /*
+     * RTPT transforms 3 vertices through rotation matrix + translation,
+     * then projects to screen coordinates using perspective division.
+     *
+     * This ASM version skips all overflow flag checking.
+     * Currently a STUB - calls internal C function gteRTPT_asm_internal
+     */
+
+    /* Get psxRegs base address */
+    la      $t0, psxRegs
+
+    /* Clear FLAG register (no overflow checking) */
+    sw      $zero, OFF_FLAG($t0)
+
+    /* For now, just call the C fast path with noflags behavior */
+    /* This stub will be replaced with full ASM implementation */
+
+    /* Save return address and call C function */
+    addiu   $sp, $sp, -8
+    sw      $ra, 4($sp)
+
+    /* Call gteRTPT_asm_internal (C function that does the work) */
+    la      $t1, gteRTPT_asm_internal
+    jalr    $t1
+    nop
+
+    /* Restore return address and return */
+    lw      $ra, 4($sp)
+    addiu   $sp, $sp, 8
+    jr      $ra
+    nop
+
+.end gte_RTPT_asm
+
+
+/***************************************************************************
+ * v294: MVMVA ASM - Matrix-Vector Multiply and Add
+ *
+ * Computes: IR = (CV + MX * V) >> sf
+ * Where MX can be rotation, light, or color matrix
+ *       V can be V0, V1, V2, or IR
+ *       CV can be TR, BK, FC, or 0
+ *
+ * Input: $a0 = gteop (opcode shifted right 10 bits)
+ *
+ * Currently a STUB - calls C version.
+ ***************************************************************************/
+
+.globl gte_MVMVA_asm
+.ent gte_MVMVA_asm
+gte_MVMVA_asm:
+    /* $a0 = gteop parameter */
+
+    /* Get psxRegs base address */
+    la      $t0, psxRegs
+
+    /* Clear FLAG register */
+    sw      $zero, OFF_FLAG($t0)
+
+    /* Save return address and gteop, call C function */
+    addiu   $sp, $sp, -16
+    sw      $ra, 12($sp)
+    sw      $a0, 8($sp)         /* save gteop */
+
+    /* Call gteMVMVA_asm_internal($a0) */
+    la      $t1, gteMVMVA_asm_internal
+    jalr    $t1
+    nop                         /* delay slot - $a0 already set */
+
+    /* Restore and return */
+    lw      $ra, 12($sp)
+    addiu   $sp, $sp, 16
+    jr      $ra
+    nop
+
+.end gte_MVMVA_asm
+
+
 /* End of gte_asm.S */

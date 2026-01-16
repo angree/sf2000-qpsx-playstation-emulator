@@ -40,6 +40,7 @@ typedef struct Rcnt
 } Rcnt;
 
 void psxRcntInit(void);
+void psxRcntReinitTiming(void);  /* QPSX_277: Reinit timing after region detection */
 void psxRcntUpdate(void);
 
 void psxRcntWcount(u32 index, u32 value);

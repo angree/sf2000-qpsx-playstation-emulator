@@ -4,18 +4,6 @@
  *  MIPSREG_AT, MIPSREG_V0, MIPSREG_V1, MIPSREG_RA                            *
  *****************************************************************************/
 
-/*
- * QPSX_079: Optimization flags (from libretro-core.cpp)
- * g_opt_nclip_inline - when enabled, NCLIP is inlined (IMPLEMENTED!)
- *
- * NCLIP inline implementation:
- *   gteNCLIP() computes: MAC0 = SX0*(SY1-SY2) + SX1*(SY2-SY0) + SX2*(SY0-SY1)
- *   This is 2D cross product for backface culling.
- *   Inline version uses ~20 MIPS instructions, avoids JAL overhead.
- *   See recNCLIP() below for implementation.
- */
-extern int g_opt_nclip_inline;
-
 /* Compile-time options (disable for debugging) */
 
 // Generate inline memory access for LWC2/SWC2 or call psxMemRead/Write C
@@ -40,7 +28,6 @@ extern int g_opt_nclip_inline;
 extern void gte##f(); \
 void rec##f() \
 { \
-	flushLoHiCache(); /* Flush LO/HI before C call */ \
 	JAL(gte##f); \
 	NOP(); /* <BD slot> */ \
 }
@@ -53,85 +40,12 @@ void rec##f() \
 extern void gte##f(u32 gteop); \
 void rec##f() \
 { \
-	flushLoHiCache(); /* Flush LO/HI before C call */ \
 	JAL(gte##f); \
 	LI16(MIPSREG_A0, (u16)(psxRegs.code >> 10)); /* <BD slot> */ \
 }
 
 CP2_FUNC_0(RTPS)
-
-/*
- * NCLIP - Normal Clipping (backface culling)
- *
- * Formula: MAC0 = SX0*(SY1-SY2) + SX1*(SY2-SY0) + SX2*(SY0-SY1)
- *
- * When g_opt_nclip_inline is enabled, we generate inline MIPS code.
- * This avoids the JAL overhead (~25+ cycles on the target hardware).
- *
- * Note: The inline version doesn't set overflow flags in gteFLAG.
- * NCLIP is used for backface culling where only the sign matters,
- * so this is acceptable for virtually all games.
- */
-extern void gteNCLIP();
-static void recNCLIP()
-{
-	if (!g_opt_nclip_inline) {
-		// Fall back to C function call
-		flushLoHiCache();
-		JAL(gteNCLIP);
-		NOP();
-		return;
-	}
-
-	// Inline NCLIP implementation
-	// MAC0 = SX0*(SY1-SY2) + SX1*(SY2-SY0) + SX2*(SY0-SY1)
-
-	// We'll use MULT instructions, so flush LO/HI cache first
-	flushLoHiCache();
-
-	// Clear FLAG register
-	SW(0, PERM_REG_1, offCP2C(31));
-
-	// Load SY values (sign-extended from high halfwords)
-	// Using TEMP_1, TEMP_2, TEMP_3 for SY0, SY1, SY2
-	LH(TEMP_1, PERM_REG_1, off(CP2D.p[12].sw.h));  // SY0
-	LH(TEMP_2, PERM_REG_1, off(CP2D.p[13].sw.h));  // SY1
-	LH(TEMP_3, PERM_REG_1, off(CP2D.p[14].sw.h));  // SY2
-
-	// Compute differences (use A0, A1, A2 as temps)
-	SUBU(MIPSREG_A0, TEMP_2, TEMP_3);  // diff0 = SY1 - SY2
-	SUBU(MIPSREG_A1, TEMP_3, TEMP_1);  // diff1 = SY2 - SY0
-	SUBU(MIPSREG_A2, TEMP_1, TEMP_2);  // diff2 = SY0 - SY1
-
-	// Load SX values (sign-extended from low halfwords)
-	// Reuse TEMP_1, TEMP_2, TEMP_3 for SX0, SX1, SX2
-	LH(TEMP_1, PERM_REG_1, off(CP2D.p[12].sw.l));  // SX0
-	LH(TEMP_2, PERM_REG_1, off(CP2D.p[13].sw.l));  // SX1
-	LH(TEMP_3, PERM_REG_1, off(CP2D.p[14].sw.l));  // SX2
-
-	// Compute products and accumulate
-	// product0 = SX0 * (SY1 - SY2)
-	MULT(TEMP_1, MIPSREG_A0);
-	MFLO(TEMP_1);  // product0 in TEMP_1
-
-	// product1 = SX1 * (SY2 - SY0)
-	MULT(TEMP_2, MIPSREG_A1);
-	MFLO(TEMP_2);  // product1 in TEMP_2
-
-	// product2 = SX2 * (SY0 - SY1)
-	MULT(TEMP_3, MIPSREG_A2);
-	MFLO(TEMP_3);  // product2 in TEMP_3
-
-	// Sum all products: MAC0 = product0 + product1 + product2
-	ADDU(TEMP_1, TEMP_1, TEMP_2);
-	ADDU(TEMP_1, TEMP_1, TEMP_3);
-
-	// Store result to MAC0 (CP2D.r[24])
-	SW(TEMP_1, PERM_REG_1, off(CP2D.r[24]));
-
-	// LO/HI now contain garbage from our MULTs, not PSX state
-	lohi_cache_valid = false;
-}
+CP2_FUNC_0(NCLIP)
 CP2_FUNC_0(NCDS)
 CP2_FUNC_0(NCDT)
 CP2_FUNC_0(CDP)
@@ -446,10 +360,6 @@ static int count_LWC2_SWC2()
 
 static void gen_LWC2_SWC2()
 {
-	// QPSX_081 FIX: LWC2/SWC2 may call psxMemRead/Write C functions
-	// which destroy native $lo/$hi. Must flush cache before any JAL.
-	flushLoHiCache();
-
 	// IMPORTANT: These registers can be overwritten by code emitted
 	//            by emitMFC2()/emitMTC2(), which we call here.
 	// TEMP_1, TEMP_2, TEMP_3

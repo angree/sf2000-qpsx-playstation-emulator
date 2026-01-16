@@ -1,14 +1,3 @@
-/*
- * QPSX Register Allocator
- *
- * Uses callee-saved registers s0-s7 (8 registers) for PSX guest register caching.
- * s8 is reserved as pointer to psxRegs structure (PERM_REG_1).
- *
- * NOTE: Do NOT add t4-t7 to this pool! They are caller-saved and get destroyed
- * by JAL() calls to C functions (psxMemRead/Write, GTE ops, etc.).
- * See future_dev_plan.txt Section 9 for detailed explanation.
- */
-
 #define REG_CACHE_START		MIPSREG_S0
 #define REG_CACHE_END		(MIPSREG_S7+1)
 
@@ -51,41 +40,18 @@ RecRegisters regcache;
 
 // Stack for regPushState()/regPopState()
 static int          regcache_bak_idx  = 0;
-static const int    regcache_bak_size = 8;
+static const int    regcache_bak_size = 8; // Abitrary size choice (overkill?)
 static RecRegisters regcache_bak[regcache_bak_size];
-
-/*
- * QPSX_079: LO/HI Register Caching (IMPLEMENTED!)
- * When enabled, MULT/DIV results stay in native $lo/$hi until flush.
- * See rec_mdu.cpp.h for full implementation.
- * v079 FIX: DIV/DIVU const paths now properly invalidate cache.
- */
-extern int g_opt_lohi_cache;
-static bool lohi_cache_valid = false;
-
-/* Flush LO/HI cache to memory if valid (called before block end/JAL) */
-static void flushLoHiCache(void)
-{
-	if (g_opt_lohi_cache && lohi_cache_valid) {
-		MFLO(TEMP_1);
-		MFHI(TEMP_2);
-		SW(TEMP_1, PERM_REG_1, offGPR(32)); // LO
-		SW(TEMP_2, PERM_REG_1, offGPR(33)); // HI
-		lohi_cache_valid = false;
-	}
-}
 
 /* Spill regs to psxRegs if they are in host regs and were modified */
 static void regClearJump(void)
 {
-	// Flush LO/HI cache before block end
-	flushLoHiCache();
-
 	for (int i = 1; i < 32; i++) {
 		if (regcache.psx[i].ismapped) {
 			int mappedto = regcache.psx[i].mappedto;
 
 			if (regcache.psx[i].psx_ischanged) {
+				//DEBUGG("mappedto %d pr %d\n", mappedto, PERM_REG_1);
 				SW(mappedto, PERM_REG_1, offGPR(i));
 			}
 
@@ -102,11 +68,13 @@ static void regClearJump(void)
 
 static void regFreeRegs(void)
 {
+	//DEBUGF("regFreeRegs\n");
 	int i = 0;
 	int firstfound = 0;
 
 	while (regcache.reglist[i] != 0xFF) {
 		int hostreg = regcache.reglist[i];
+		//DEBUGF("spilling %dth reg (%d)", i, hostreg);
 
 		if (!regcache.host[hostreg].host_islocked) {
 			int psxreg = regcache.host[hostreg].mappedto;
@@ -125,9 +93,11 @@ static void regFreeRegs(void)
 
 			if (firstfound == 0) {
 				regcache.reglist_cnt = i;
+				//DEBUGF("setting reglist_cnt %d", i);
 				firstfound = 1;
 			}
 		}
+		//else DEBUGF("locked :(");
 
 		i++;
 	}
@@ -137,17 +107,23 @@ static void regFreeRegs(void)
 
 static u32 regAllocHost()
 {
+	//DEBUGF("regMipsToHostHelper regpsx %d action %d type %d reglist_cnt %d", regpsx, action, type, regcache.reglist_cnt);
 	int regnum = regcache.reglist[regcache.reglist_cnt];
 
+	//DEBUGF("regnum 1 %d", regnum);
+
 	while (regnum != 0xFF) {
+		//DEBUGF("checking reg %d", regnum);
 		if (regcache.host[regnum].host_type == REG_EMPTY) {
 			break;
 		}
 
 		regcache.reglist_cnt++;
+		//DEBUGF("setting reglist_cnt %d", regcache.reglist_cnt);
 		regnum = regcache.reglist[regcache.reglist_cnt];
 	}
 
+	//DEBUGF("regnum 2 %d", regnum);
 	if (regnum == 0xFF) {
 		regFreeRegs();
 		regnum = regcache.reglist[regcache.reglist_cnt];
@@ -156,6 +132,7 @@ static u32 regAllocHost()
 	}
 
 	regcache.reglist_cnt++;
+	//DEBUGF("setting reglist_cnt %d", regcache.reglist_cnt);
 
 	return regnum;
 }
@@ -190,6 +167,7 @@ static u32 regMipsToHostHelper(u32 regpsx, u32 action, u32 type)
 			LW(regnum, PERM_REG_1, offGPR(regpsx));
 		}
 
+		//DEBUGF("regnum 3 %d", regnum);
 		return regnum;
 	}
 
@@ -213,13 +191,16 @@ static u32 regMipsToHost(u32 regpsx, u32 action, u32 type)
 	if (!regpsx)
 		return 0;
 
+	//DEBUGF("starting for regpsx %d, action %d, type %d", regpsx, action, type);
 	if (regcache.psx[regpsx].ismapped) {
+		//DEBUGF("regpsx %d is mapped", regpsx);
 		if (action != REG_LOADBRANCH) {
 			int hostreg = regcache.psx[regpsx].mappedto;
 			regcache.host[hostreg].host_islocked++;
 
 			return hostreg;
 		} else {
+			//DEBUGF("loadbranch regpsx %d", regpsx);
 			u32 mappedto = regcache.psx[regpsx].mappedto;
 
 			if (regcache.psx[regpsx].psx_ischanged) {
@@ -241,6 +222,7 @@ static u32 regMipsToHost(u32 regpsx, u32 action, u32 type)
 		}
 	}
 
+	//DEBUGF("calling helper");
 	return regMipsToHostHelper(regpsx, action, type);
 }
 
@@ -265,9 +247,6 @@ static void regUnlock(u32 reghost)
 
 static void regClearBranch(void)
 {
-	// Flush LO/HI cache before branch
-	flushLoHiCache();
-
 	for (int i = 1; i < 32; i++) {
 		if (regcache.psx[i].ismapped && regcache.psx[i].psx_ischanged) {
 			SW(regcache.psx[i].mappedto, PERM_REG_1, offGPR(i));
@@ -278,15 +257,12 @@ static void regClearBranch(void)
 static void regReset()
 {
 	int i, i2;
-
-	/* Clear PSX register state */
 	for (i = 0; i < 32; i++) {
 		regcache.psx[i].psx_ischanged = false;
 		regcache.psx[i].ismapped = false;
 		regcache.psx[i].mappedto = 0;
 	}
 
-	/* Initialize all host registers as reserved */
 	for (i = 0; i < 32; i++) {
 		regcache.host[i].host_type = REG_RESERVED;
 		regcache.host[i].host_age = 0;
@@ -296,13 +272,10 @@ static void regReset()
 		regcache.host[i].mappedto = 0;
 	}
 
-	/* Mark register pool (s0-s7) as available */
 	for (i = REG_CACHE_START; i < REG_CACHE_END; i++)
 		regcache.host[i].host_type = REG_EMPTY;
 
-	/* Build reglist */
-	i2 = 0;
-	for (i = REG_CACHE_START; i < REG_CACHE_END; i++) {
+	for (i = 0, i2 = 0; i < 32; i++) {
 		if (regcache.host[i].host_type == REG_EMPTY) {
 			regcache.reglist[i2] = i;
 			i2++;
@@ -311,10 +284,8 @@ static void regReset()
 
 	regcache.reglist[i2] = 0xFF;
 	regcache.reglist_cnt = 0;
-	regcache_bak_idx = 0;
-
-	// Reset LO/HI cache state
-	lohi_cache_valid = false;
+	regcache_bak_idx = 0; // Empty regcache stack
+	//DEBUGF("reglist len %d", i2);
 }
 
 static void regUpdate(void)
