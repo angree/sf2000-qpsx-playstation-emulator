@@ -9,7 +9,7 @@ Based on PCSX4ALL with MIPS-to-MIPS dynamic recompiler, ported to the SF2000/GB3
 ## Changelog v393
 
 ### Minor Performance Improvements
-- **~5-10% faster** than previous public release - added few ASM/buffor optimizations
+- **~5-10% faster** (3D games) than previous public release - added few ASM/buffor optimizations
 - Added Sound OFF, ON and TURBO options. 
 
 ## Changelog v374
