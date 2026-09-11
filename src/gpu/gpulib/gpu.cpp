@@ -21,7 +21,7 @@
 extern "C" {
     extern void xlog(const char *fmt, ...);
 }
-#define GPU_LOG(fmt, ...) xlog("GPU: " fmt "\n", ##__VA_ARGS__)
+#define GPU_LOG(fmt, ...) printf("GPU: " fmt "\n", ##__VA_ARGS__)
 #else
 #define GPU_LOG(fmt, ...) printf("GPU: " fmt "\n", ##__VA_ARGS__)
 #endif

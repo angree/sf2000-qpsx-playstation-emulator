@@ -558,20 +558,20 @@ void psxRcntReinitTiming(void)
      */
     scaled_pal_cycles = 8864320;    /* Always 100% - no scaling */
     scaled_ntsc_cycles = 8791293;   /* Always 100% - no scaling */
-    xlog("RCNT_349: VSync timing at 100%% (throttling in retro_run handles target_speed=%d%%)",
+    printf("RCNT_349: VSync timing at 100%% (throttling in retro_run handles target_speed=%d%%)",
          g_target_speed);
 
-    xlog("RCNT_FIX: psxRcntReinitTiming() PsxType=%d (%s)",
+    printf("RCNT_FIX: psxRcntReinitTiming() PsxType=%d (%s)",
          Config.PsxType, Config.PsxType == PSX_TYPE_PAL ? "PAL" : "NTSC");
-    xlog("RCNT_FIX: rcnts[3].target: old=%u new=%u", old_target, new_target);
+    printf("RCNT_FIX: rcnts[3].target: old=%u new=%u", old_target, new_target);
 
     if (old_target != new_target) {
-        xlog("RCNT_FIX: TIMING WAS WRONG! Fixing...");
+        printf("RCNT_FIX: TIMING WAS WRONG! Fixing...");
         rcnts[3].target = new_target;
         rcnts[3].cycle = new_target * rcnts[3].rate;
         _psxRcntWcount(3, 0);
         psxRcntSet();
-        xlog("RCNT_FIX: Fixed! rcnts[3].cycle=%u", rcnts[3].cycle);
+        printf("RCNT_FIX: Fixed! rcnts[3].cycle=%u", rcnts[3].cycle);
     }
 }
 

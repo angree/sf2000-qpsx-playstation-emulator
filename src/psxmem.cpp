@@ -35,7 +35,13 @@
 /* v367: Memory optimizations HARDCODED:
  * - g_opt_skip_code_inv = 0 (always do code invalidation)
  * - g_opt_asm_memwrite = 0 (pure C path)
- * All IF checks and ASM levels REMOVED from source code. */
+ * All IF checks and ASM levels REMOVED from source code.
+ *
+ * v378h: SMC check reduction - use page-based tracking to skip
+ * unnecessary psxCpu->Clear() calls. Only invalidate if the page
+ * actually contains compiled code. This eliminates ~99% of
+ * unnecessary invalidations during CD streaming, DMA transfers etc.
+ */
 
 /* v099: Pure assembly memory functions (defined in psxmem_asm.S) */
 #if defined(SF2000) || defined(__mips__)
@@ -171,16 +177,16 @@ int psxMemInit()
 	 * Memory test: Write pattern, read back, verify.
 	 */
 	if (!psxM_allocated) {
-		xlog("QPSX_232_TEST: Using FIXED address 0x%08X for PSX RAM!\n", QPSX_FIXED_PSXM_ADDR);
+		printf("QPSX_232_TEST: Using FIXED address 0x%08X for PSX RAM!\n", QPSX_FIXED_PSXM_ADDR);
 		psxM = (s8*)QPSX_FIXED_PSXM_ADDR;
 
 		/* Memory integrity test - write pattern and verify */
-		xlog("QPSX_232_TEST: Testing memory integrity...\n");
+		printf("QPSX_232_TEST: Testing memory integrity...\n");
 		volatile u32 *test_ptr = (volatile u32*)psxM;
 		int test_ok = 1;
 
 		/* Test 1: Write/read first 16 words */
-		xlog("QPSX_232_TEST: Test 1 - First 16 words at 0x%08X\n", (u32)test_ptr);
+		printf("QPSX_232_TEST: Test 1 - First 16 words at 0x%08X\n", (u32)test_ptr);
 		for (i = 0; i < 16; i++) {
 			test_ptr[i] = 0xDEAD0000 | i;
 		}
@@ -188,14 +194,14 @@ int psxMemInit()
 			u32 val = test_ptr[i];
 			u32 expected = 0xDEAD0000 | i;
 			if (val != expected) {
-				xlog("QPSX_232_TEST: FAIL at offset %d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
+				printf("QPSX_232_TEST: FAIL at offset %d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
 				test_ok = 0;
 			}
 		}
 
 		/* Test 2: Write/read at 1MB offset (middle of 2MB) */
 		volatile u32 *mid_ptr = (volatile u32*)((u8*)psxM + 0x100000);
-		xlog("QPSX_232_TEST: Test 2 - Middle at 0x%08X\n", (u32)mid_ptr);
+		printf("QPSX_232_TEST: Test 2 - Middle at 0x%08X\n", (u32)mid_ptr);
 		for (i = 0; i < 16; i++) {
 			mid_ptr[i] = 0xBEEF0000 | i;
 		}
@@ -203,14 +209,14 @@ int psxMemInit()
 			u32 val = mid_ptr[i];
 			u32 expected = 0xBEEF0000 | i;
 			if (val != expected) {
-				xlog("QPSX_232_TEST: FAIL at 1MB+%d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
+				printf("QPSX_232_TEST: FAIL at 1MB+%d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
 				test_ok = 0;
 			}
 		}
 
 		/* Test 3: Write/read at end (near 2MB) */
 		volatile u32 *end_ptr = (volatile u32*)((u8*)psxM + 0x1FFFC0);  /* 2MB - 64 bytes */
-		xlog("QPSX_232_TEST: Test 3 - End at 0x%08X\n", (u32)end_ptr);
+		printf("QPSX_232_TEST: Test 3 - End at 0x%08X\n", (u32)end_ptr);
 		for (i = 0; i < 16; i++) {
 			end_ptr[i] = 0xCAFE0000 | i;
 		}
@@ -218,20 +224,20 @@ int psxMemInit()
 			u32 val = end_ptr[i];
 			u32 expected = 0xCAFE0000 | i;
 			if (val != expected) {
-				xlog("QPSX_232_TEST: FAIL at end+%d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
+				printf("QPSX_232_TEST: FAIL at end+%d: wrote 0x%08X, read 0x%08X\n", i*4, expected, val);
 				test_ok = 0;
 			}
 		}
 
 		if (test_ok) {
-			xlog("QPSX_232_TEST: Memory test PASSED! Fixed address is usable.\n");
+			printf("QPSX_232_TEST: Memory test PASSED! Fixed address is usable.\n");
 			psxM_allocated = true;
 			psxM_is_fixed_addr = true;  /* Mark as fixed - don't free() later! */
 		} else {
-			xlog("QPSX_232_TEST: Memory test FAILED! Falling back to malloc.\n");
+			printf("QPSX_232_TEST: Memory test FAILED! Falling back to malloc.\n");
 			psxM = (s8*)malloc(0x200000);
 			psxM_allocated = psxM != NULL;
-			xlog("QPSX_232_TEST: malloc fallback: psxM=0x%08X\n", (u32)psxM);
+			printf("QPSX_232_TEST: malloc fallback: psxM=0x%08X\n", (u32)psxM);
 		}
 	}
 #else
@@ -284,8 +290,8 @@ int psxMemInit()
 void psxMemReset()
 {
 #ifdef SF2000
-	xlog("QPSX: >>> psxMemReset() ENTER <<<\n");
-	xlog("QPSX_232_TEST: psxM=0x%08X (fixed=%d)\n", (u32)psxM, psxM_is_fixed_addr ? 1 : 0);
+	printf("QPSX: >>> psxMemReset() ENTER <<<\n");
+	printf("QPSX_232_TEST: psxM=0x%08X (fixed=%d)\n", (u32)psxM, psxM_is_fixed_addr ? 1 : 0);
 #endif
 
 #ifndef SF2000
@@ -305,7 +311,7 @@ void psxMemReset()
 #ifdef SF2000
 	// SF2000: Try direct BIOS load with fallback, use xlog for logging
 	// QPSX_043: Try multiple BIOS files in order of preference
-	xlog("QPSX: psxMemReset() - Config.HLE=%d\n", Config.HLE);
+	printf("QPSX: psxMemReset() - Config.HLE=%d\n", Config.HLE);
 	if (Config.HLE == FALSE) {
 		// Try multiple BIOS files in order: configured, NTSC, PAL
 		const char *bios_files[] = {
@@ -320,17 +326,17 @@ void psxMemReset()
 		int bios_loaded = 0;
 		for (int i = 0; bios_files[i] != NULL && !bios_loaded; i++) {
 			if (snprintf(bios, MAXPATHLEN, "%s/%s", Config.BiosDir, bios_files[i]) < MAXPATHLEN) {
-				xlog("QPSX: Trying BIOS: '%s'\n", bios);
+				printf("QPSX: Trying BIOS: '%s'\n", bios);
 				f = fopen(bios, "rb");
 				if (f != NULL) {
 					size_t bytes_read, bytes_expected = 0x80000;
 					bytes_read = fread(psxR, 1, bytes_expected, f);
 					fclose(f);
-					xlog("QPSX: Read %u bytes (expected %u)\n", (unsigned)bytes_read, (unsigned)bytes_expected);
+					printf("QPSX: Read %u bytes (expected %u)\n", (unsigned)bytes_read, (unsigned)bytes_expected);
 					if (bytes_read >= bytes_expected) {
-						xlog("QPSX: SUCCESS - Loaded BIOS: %s\n", bios);
+						printf("QPSX: SUCCESS - Loaded BIOS: %s\n", bios);
 						// Log first few bytes of BIOS to verify it loaded correctly
-						xlog("QPSX: BIOS header: %02X %02X %02X %02X\n",
+						printf("QPSX: BIOS header: %02X %02X %02X %02X\n",
 							(unsigned char)psxR[0], (unsigned char)psxR[1],
 							(unsigned char)psxR[2], (unsigned char)psxR[3]);
 						bios_loaded = 1;
@@ -340,11 +346,11 @@ void psxMemReset()
 		}
 
 		if (!bios_loaded) {
-			xlog("QPSX: FAIL - No BIOS found, using HLE\n");
+			printf("QPSX: FAIL - No BIOS found, using HLE\n");
 			Config.HLE = TRUE;
 		}
 	} else {
-		xlog("QPSX: HLE mode requested\n");
+		printf("QPSX: HLE mode requested\n");
 	}
 #else
 	if (Config.HLE==FALSE) {
@@ -404,7 +410,7 @@ void psxMemShutdown()
 	if (psxM_allocated) {
 		if (psxM_is_fixed_addr) {
 #ifdef SF2000
-			xlog("QPSX_232_TEST: psxM is fixed addr, skipping free()\n");
+			printf("QPSX_232_TEST: psxM is fixed addr, skipping free()\n");
 #endif
 			psxM = NULL;
 			psxM_allocated = false;
@@ -521,7 +527,9 @@ void psxMemWrite8(u32 mem, u8 value)
 		if (p != NULL) {
 			*(u8*)(p + m) = value;
 #ifdef PSXREC
-			psxCpu->Clear((mem & (~3)), 1);
+			/* v378h: Only invalidate if page has compiled code */
+			if (psxmem_page_has_code(mem))
+				psxCpu->Clear((mem & (~3)), 1);
 #endif
 		} else {
 			PSXMEM_LOG("%s(): err sb 0x%08x\n", __func__, mem);
@@ -545,7 +553,9 @@ void psxMemWrite16(u32 mem, u16 value)
 		if (p != NULL) {
 			*(u16*)(p + m) = SWAPu16(value);
 #ifdef PSXREC
-			psxCpu->Clear((mem & (~3)), 1);
+			/* v378h: Only invalidate if page has compiled code */
+			if (psxmem_page_has_code(mem))
+				psxCpu->Clear((mem & (~3)), 1);
 #endif
 		} else {
 			PSXMEM_LOG("%s(): err sh 0x%08x\n", __func__, mem);
@@ -583,8 +593,10 @@ void psxMemWrite32(u32 mem, u32 value)
 		if (p != NULL) {
 			*(u32*)(p + m) = SWAPu32(value);
 #ifdef PSXREC
-			/* v367: Always do code invalidation (hardcoded) */
-			psxCpu->Clear(mem, 1);
+			/* v378h: Only invalidate if page has compiled code
+			 * This eliminates ~99% of unnecessary Clear() calls */
+			if (psxmem_page_has_code(mem))
+				psxCpu->Clear(mem, 1);
 #endif
 		} else {
 			if (mem != 0xfffe0130) {

@@ -2843,8 +2843,33 @@ void biosInterrupt(void) {
 void psxBiosException(void) {
 	int i;
 
-	switch (psxRegs.CP0.n.Cause & 0x3c) {
+	u32 excCode = psxRegs.CP0.n.Cause & 0x3c;
+
+	switch (excCode) {
 		case 0x00: // Interrupt
+		{
+			// Check if any BIOS-level interrupt handlers are registered.
+			// If not, the game is using its own bare-metal exception handler
+			// at 0x80000080 (e.g. ps1-bare-metal framework). Return immediately
+			// so the game's handler can run instead of HLE swallowing the IRQ.
+			bool has_bios_handlers = (jmp_int != NULL) || (pad_buf != NULL);
+			if (!has_bios_handlers) {
+				for (int j = 0; j < 8; j++) {
+					if (SysIntRP[j]) { has_bios_handlers = true; break; }
+				}
+			}
+			if (!has_bios_handlers && RcEV) {
+				// Check VSync and root counter events (the most common BIOS events)
+				for (int j = 0; j < 4; j++) {
+					if (RcEV[j][1].status == EvStACTIVE) {
+						has_bios_handlers = true; break;
+					}
+				}
+			}
+			if (!has_bios_handlers) {
+				return;  // PC already set to 0x80000080 by psxException(), let game handle it
+			}
+
 			interrupt_r26=psxRegs.CP0.n.EPC;
 			SaveRegs();
 
@@ -2856,8 +2881,10 @@ void psxBiosException(void) {
 				if (SysIntRP[i]) {
 					u32 *queue = (u32*)PSXM(SysIntRP[i]);
 
-					s0 = queue[2];
-					softCall(queue[1]);
+					if (queue) {
+						s0 = queue[2];
+						softCall(queue[1]);
+					}
 				}
 			}
 
@@ -2879,7 +2906,9 @@ void psxBiosException(void) {
 			}
 			psxHwWrite16(0x1f801070, 0);
 			ResetIoCycle();
+			LoadRegs();
 			break;
+		}
 
 		case 0x20: // Syscall
 			switch (a0) {
@@ -2891,7 +2920,7 @@ void psxBiosException(void) {
 					break;
 
 				case 2: // ExitCritical - enable irq's
-					psxRegs.CP0.n.Status|= 0x404; 
+					psxRegs.CP0.n.Status|= 0x404;
 					break;
 			}
 			ResetIoCycle();

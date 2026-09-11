@@ -61,21 +61,21 @@ int psxInit() {
 }
 
 void psxReset() {
-	xlog("QPSX: >>> psxReset() START <<<\n");
-	xlog("QPSX: Config.HLE=%d\n", Config.HLE);
+	printf("QPSX: >>> psxReset() START <<<\n");
+	printf("QPSX: Config.HLE=%d\n", Config.HLE);
 
 	psxCpu->Reset();
-	xlog("QPSX: psxCpu->Reset() done\n");
+	printf("QPSX: psxCpu->Reset() done\n");
 
 	psxMemReset();
-	xlog("QPSX: psxMemReset() done\n");
+	printf("QPSX: psxMemReset() done\n");
 
 	memset(&psxRegs, 0, sizeof(psxRegs));
 
 	psxRegs.writeok = 1;
 
 	psxRegs.pc = 0xbfc00000; // Start in bootstrap
-	xlog("QPSX: PC set to 0x%08X (BIOS entry)\n", psxRegs.pc);
+	printf("QPSX: PC set to 0x%08X (BIOS entry)\n", psxRegs.pc);
 
 	psxRegs.psxM = psxM;	// PSX Memory
 	psxRegs.psxP = psxP;	// PSX Memory
@@ -86,23 +86,23 @@ void psxReset() {
 	psxRegs.CP0.r[15] = 0x00000002; // PRevID = Revision ID, same as R3000A
 
 	psxEvqueueInit();  // Event scheduler queue
-	xlog("QPSX: psxEvqueueInit() done\n");
+	printf("QPSX: psxEvqueueInit() done\n");
 
 	psxHwReset();
-	xlog("QPSX: psxHwReset() done\n");
+	printf("QPSX: psxHwReset() done\n");
 
 	psxBiosInit();
-	xlog("QPSX: psxBiosInit() done\n");
+	printf("QPSX: psxBiosInit() done\n");
 
 	// QPSX_052: Don't call psxExecuteBios() here for real BIOS
 	// It will be called from libretro-core AFTER CD-ROM is opened
 	if (Config.HLE) {
-		xlog("QPSX: Using HLE BIOS - no BIOS execution needed\n");
+		printf("QPSX: Using HLE BIOS - no BIOS execution needed\n");
 	} else {
-		xlog("QPSX: Using REAL BIOS - psxExecuteBios() will be called after CD open\n");
+		printf("QPSX: Using REAL BIOS - psxExecuteBios() will be called after CD open\n");
 	}
 
-	xlog("QPSX: <<< psxReset() DONE >>>\n");
+	printf("QPSX: <<< psxReset() DONE >>>\n");
 }
 
 void psxShutdown() {
@@ -155,7 +155,7 @@ void psxBranchTest()
 	/* v141 DEBUG: Log psxBranchTest entry to verify it's called */
 	static int branch_entry_count = 0;
 	if (branch_entry_count < 10) {
-		xlog("BRANCH: psxBranchTest entry #%d cycle=%u", branch_entry_count, psxRegs.cycle);
+		printf("BRANCH: psxBranchTest entry #%d cycle=%u", branch_entry_count, psxRegs.cycle);
 		branch_entry_count++;
 	}
 
@@ -207,7 +207,7 @@ static inline int psxExecuteBiosEnded(void) {
  * interrupts never fire and BIOS loops forever at ~0xBFC00434.
  */
 void psxExecuteBios() {
-	xlog("QPSX: psxExecuteBios() START, PC=0x%08X\n", psxRegs.pc);
+	printf("QPSX: psxExecuteBios() START, PC=0x%08X\n", psxRegs.pc);
 
 	unsigned int iterations = 0;
 	const unsigned int max_iterations = 5000000;
@@ -226,14 +226,14 @@ void psxExecuteBios() {
 
 		// Log progress every 100k iterations
 		if (iterations % 100000 == 0) {
-			xlog("QPSX: BIOS iter=%u PC=0x%08X cycle=%u\n",
+			printf("QPSX: BIOS iter=%u PC=0x%08X cycle=%u\n",
 			     iterations, psxRegs.pc, psxRegs.cycle);
 		}
 	}
 
 	if (iterations >= max_iterations) {
-		xlog("QPSX: BIOS timeout after %u iters, PC=0x%08X\n", iterations, psxRegs.pc);
+		printf("QPSX: BIOS timeout after %u iters, PC=0x%08X\n", iterations, psxRegs.pc);
 	} else {
-		xlog("QPSX: psxExecuteBios() DONE after %u iters, PC=0x%08X\n", iterations, psxRegs.pc);
+		printf("QPSX: psxExecuteBios() DONE after %u iters, PC=0x%08X\n", iterations, psxRegs.pc);
 	}
 }

@@ -33,7 +33,7 @@
 extern "C" {
     extern void xlog(const char *fmt, ...);
 }
-#define GPUIF_LOG(fmt, ...) xlog("GPUIF: " fmt "\n", ##__VA_ARGS__)
+#define GPUIF_LOG(fmt, ...) printf("GPUIF: " fmt "\n", ##__VA_ARGS__)
 #else
 #define GPUIF_LOG(fmt, ...) printf("GPUIF: " fmt "\n", ##__VA_ARGS__)
 #endif

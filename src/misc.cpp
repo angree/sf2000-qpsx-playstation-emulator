@@ -39,7 +39,7 @@
 extern "C" {
     extern void xlog(const char *fmt, ...);
 }
-#define MISC_LOG(fmt, ...) xlog("MISC: " fmt "\n", ##__VA_ARGS__)
+#define MISC_LOG(fmt, ...) printf("MISC: " fmt "\n", ##__VA_ARGS__)
 #else
 #define MISC_LOG(fmt, ...) printf("MISC: " fmt "\n", ##__VA_ARGS__)
 #endif

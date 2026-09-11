@@ -35,7 +35,7 @@
 extern "C" {
     extern void xlog(const char *fmt, ...);
 }
-#define SIO_LOG(fmt, ...) xlog("SIO: " fmt "\n", ##__VA_ARGS__)
+#define SIO_LOG(fmt, ...) printf("SIO: " fmt "\n", ##__VA_ARGS__)
 #else
 #define SIO_LOG(fmt, ...) printf("SIO: " fmt "\n", ##__VA_ARGS__)
 #endif

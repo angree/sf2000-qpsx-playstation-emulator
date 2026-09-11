@@ -140,6 +140,19 @@ void psxMemWrite32(u32 mem, u32 value);
 
 void psxMemWrite32_CacheCtrlPort(u32 value);
 
+/* v378h: SMC page check - check if a page contains compiled code.
+ * Returns true if the page MAY have code (needs invalidation).
+ * Used to skip unnecessary psxCpu->Clear() calls.
+ * code_pages[] is defined in recompiler.cpp
+ */
+#ifdef PSXREC
+extern u8 code_pages[];
+static inline int psxmem_page_has_code(u32 addr) {
+	u32 page = (addr & 0x1fffff) / 4096;
+	return code_pages[page / 8] & (1 << (page & 7));
+}
+#endif
+
 u8   psxMemRead8_direct(u32 mem,void *regs);
 u16  psxMemRead16_direct(u32 mem,void *regs);
 u32  psxMemRead32_direct(u32 mem,void *regs);

@@ -35,7 +35,7 @@
 extern "C" {
     extern void xlog(const char *fmt, ...);
 }
-#define PLUG_LOG(fmt, ...) xlog("PLUG: " fmt "\n", ##__VA_ARGS__)
+#define PLUG_LOG(fmt, ...) printf("PLUG: " fmt "\n", ##__VA_ARGS__)
 #else
 #define PLUG_LOG(fmt, ...) printf("PLUG: " fmt "\n", ##__VA_ARGS__)
 #endif

@@ -122,7 +122,7 @@ extern "C" void xlog(const char *fmt, ...);
 /* Bit vector indicating which PS1 RAM pages contain the start of blocks.
  *  Used to determine when code invalidation in recClear() can be skipped.
  */
-static u8 code_pages[0x200000/4096/8];
+u8 code_pages[0x200000/4096/8];
 
 /* Pointers to the recompiled blocks go here. psxRecLUT[] uses upper 16 bits of
  *  a PC value as an index to lookup a block pointer stored in recRAM/recROM.
@@ -920,6 +920,12 @@ __asm__ __volatile__ (
 // incremented by when a block returns.
 "move  $v1, $0                                \n"
 
+// v378e: Initialize event delta register $t9
+// $t9 = io_cycle_counter - cycle = cycles until next event
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
+"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+"subu  $t9, $t4, $t3                          \n" // $t9 = cycles until next event
+
 // Align loop on cache-line boundary
 ".balign 32                                   \n"
 
@@ -931,27 +937,28 @@ __asm__ __volatile__ (
 // NOTE: Loop expects following values to be set:
 // $v0 = new value for psxRegs.pc
 // $v1 = # of cycles to increment psxRegs.cycle by
+// $t9 = event_delta (cycles until next event) - v378e
 
-// The loop pseudocode is this, interleaving ops to reduce load stalls:
+// v378e: EVENT DELTA IN REGISTER OPTIMIZATION
+// The loop pseudocode is now:
 //
 // loop:
+// $t9 -= $v1                              // Subtract block cycles from event delta
 // $t2 = REC_RAM_VADDR | ($v0 & 0x00ffffff)
 // $t0 = *($t2)
 // psxRegs.cycle += $v1
-// if (psxRegs.cycle >= psxRegs.io_cycle_counter)
+// if ($t9 <= 0)                           // EVENT DELTA CHECK (register only!)
 //    goto call_psxBranchTest;
 // psxRegs.pc = $v0
 // if ($t0 == 0)
 //    goto recompile_block;
 // $ra = block return address
 // goto $t0;
-// /* Code at addr $t0 will run and return having set $v0 to new psxRegs.pc */
-// /*  value and $v1 to the number of cycles to increment psxRegs.cycle by. */
 
 // Infinite loop, blocks return here
 "loop%=:                                      \n"
-"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
-"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+// v378e: Subtract block cycles from event delta FIRST (critical path)
+"subu  $t9, $t9, $v1                          \n" // $t9 -= $v1 (event delta decrement)
 
 // The block ptrs are mapped virtually to address space allowing lower
 //  24 bits of PS1 PC address to lookup start of any RAM or ROM code block.
@@ -963,22 +970,22 @@ __asm__ __volatile__ (
 "srl   $t1, $t1, 8                            \n"
 "or    $t2, $t2, $t1                          \n"
 #endif
-"lw    $t0, 0($t2)                            \n" // $t0 = address of start of block code, or
-                                                  //       or 0 if block needs recompilation
-                                                  // IMPORTANT: leave block ptr in $t2, it gets
-                                                  // saved & re-used if recRecompile() is called.
 
+// Load block pointer while we do cycle accounting (hide latency)
+"lw    $t0, 0($t2)                            \n" // $t0 = address of start of block code
+
+// Update psxRegs.cycle
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
 "addu  $t3, $t3, $v1                          \n" // $t3 = psxRegs.cycle + $v1
+"sw    $t3, %[psxRegs_cycle_off]($fp)         \n" // Store new psxRegs.cycle val
 
-// Must call psxBranchTest() when psxRegs.cycle >= psxRegs.io_cycle_counter
-"sltu  $t4, $t3, $t4                          \n"
-"beqz  $t4, call_psxBranchTest%=              \n"
-"sw    $t3, %[psxRegs_cycle_off]($fp)         \n" // <BD> IMPORTANT: store new psxRegs.cycle val,
-                                                  //  whether or not we are branching here
+// v378e: EVENT CHECK - just test if $t9 <= 0 (signed compare)
+"blez  $t9, call_psxBranchTest%=              \n" // if event_delta <= 0, handle events
+"sw    $v0, %[psxRegs_pc_off]($fp)            \n" // <BD> Store new psxRegs.pc val
 
 // Recompile block, if necessary
 "beqz  $t0, recompile_block%=                 \n"
-"sw    $v0, %[psxRegs_pc_off]($fp)            \n" // <BD> Use BD slot to store new psxRegs.pc val
+"nop                                          \n" // <BD>
 
 // Execute already-compiled block. It will return at top of loop.
 "execute_block%=:                             \n"
@@ -990,27 +997,31 @@ __asm__ __volatile__ (
 ////////////////////////////
 
 // Call psxBranchTest() and go back to top of loop
+// v378e: After psxBranchTest returns, recalculate $t9
 "call_psxBranchTest%=:                        \n"
 "jal   %[psxBranchTest]                       \n"
-"sw    $v0, %[psxRegs_pc_off]($fp)            \n" // <BD> Use BD slot to store new psxRegs.pc val,
-                                                  //  as psxBranchTest() might issue an exception.
+"nop                                          \n" // <BD> PC already saved above
 // QPSX_039: Check emu_frame_complete flag - exit if frame is done
 "lui   $t5, %%hi(%[emu_frame_complete])       \n"
 "lw    $t6, %%lo(%[emu_frame_complete])($t5)  \n"
 "bnez  $t6, exit%=                            \n" // Exit loop if frame complete
 "nop                                          \n"
-"lw    $v0, %[psxRegs_pc_off]($fp)            \n" // After psxBranchTest() returns, load psxRegs.pc
-                                                  //  back into $v0, which could be different than
-                                                  //  before the call if an exception was issued.
+// v378e: Recalculate event delta after psxBranchTest
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
+"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+"subu  $t9, $t4, $t3                          \n" // $t9 = new event delta
+"lw    $v0, %[psxRegs_pc_off]($fp)            \n" // Load psxRegs.pc (may have changed)
 "b     loop%=                                 \n" // Go back to top to process psxRegs.pc again..
-"move  $v1, $0                                \n" // <BD> ..using BD slot to set $v1 to 0, since
-                                                  //  psxRegs.cycle shouldn't be incremented again.
+"move  $v1, $0                                \n" // <BD> Set $v1 to 0, cycle already updated
 
 // Recompile block and return to normal codepath.
+// v378e: Save/restore $t9 (event delta) across recRecompile call
 "recompile_block%=:                           \n"
+"sw    $t9, %[psxRegs_cycles_until_event]($fp) \n" // Save event delta to psxRegs
 "jal   %[recRecompile]                        \n"
 "sw    $t2, f_off_temp_var1($sp)              \n" // <BD> Save block ptr across call
 "lw    $t2, f_off_temp_var1($sp)              \n" // Restore block ptr upon return
+"lw    $t9, %[psxRegs_cycles_until_event]($fp) \n" // Restore event delta
 "lw    $v0, %[psxRegs_pc_off]($fp)            \n" // Blocks expect $v0 to contain PC val on entry
 "b     execute_block%=                        \n" // Resume normal code path, but first we must..
 "lw    $t0, 0($t2)                            \n" // <BD> ..load $t0 with ptr to block code
@@ -1026,6 +1037,7 @@ __asm__ __volatile__ (
   [psxRegs_pc_off]             "i" (off(pc)),
   [psxRegs_cycle_off]          "i" (off(cycle)),
   [psxRegs_io_cycle_ctr_off]   "i" (off(io_cycle_counter)),
+  [psxRegs_cycles_until_event] "i" (off(cycles_until_event)),
   [recRecompile]               "i" (&recRecompile),
   [psxBranchTest]              "i" (&psxBranchTest),
   [REC_RAM_VADDR_UPPER]        "i" (REC_RAM_VADDR >> 16),
@@ -1305,6 +1317,13 @@ __asm__ __volatile__ (
 // incremented by when a block returns.
 "move  $v1, $0                                \n"
 
+// v378e: Initialize event delta register $t9
+// $t9 = io_cycle_counter - cycle = cycles until next event
+// This is a POPS-style optimization - event check becomes a single register test
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
+"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+"subu  $t9, $t4, $t3                          \n" // $t9 = cycles until next event
+
 // Align loop on cache-line boundary
 ".balign 32                                   \n"
 
@@ -1316,29 +1335,28 @@ __asm__ __volatile__ (
 // NOTE: Loop expects following values to be set:
 // $v0 = new value for psxRegs.pc
 // $v1 = # of cycles to increment psxRegs.cycle by
+// $t9 = event_delta (cycles until next event) - v378e
 
-// The loop pseudocode is this, interleaving ops to reduce load stalls:
+// v378e: EVENT DELTA IN REGISTER OPTIMIZATION
+// The loop pseudocode is now:
 //
 // loop:
+// $t9 -= $v1                              // Subtract block cycles from event delta
 // $t2 = REC_RAM_VADDR | ($v0 & 0x00ffffff)
 // $t0 = *($t2)
 // psxRegs.cycle += $v1
-// if (psxRegs.cycle >= psxRegs.io_cycle_counter)
+// if ($t9 <= 0)                           // EVENT DELTA CHECK (register only!)
 //    goto call_psxBranchTest;
 // psxRegs.pc = $v0
 // if ($t0 == 0)
 //    goto recompile_block;
 // tmp_block_start_addr = $t0
 // goto $t0;
-// /* Code at addr $t0 will run and return having set $v0 to new psxRegs.pc */
-// /*  value and $v1 to the number of cycles to increment psxRegs.cycle by. */
-// /* If block branches back to its beginning, it will return to the        */
-// /*  fastpath version of loop that skips looking up a code pointer.       */
 
 // Infinite loop, blocks return here
 "loop%=:                                      \n"
-"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
-"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+// v378e: Subtract block cycles from event delta FIRST (critical path)
+"subu  $t9, $t9, $v1                          \n" // $t9 -= $v1 (event delta decrement)
 
 // The block ptrs are mapped virtually to address space allowing lower
 //  24 bits of PS1 PC address to lookup start of any RAM or ROM code block.
@@ -1350,22 +1368,24 @@ __asm__ __volatile__ (
 "srl   $t1, $t1, 8                            \n"
 "or    $t2, $t2, $t1                          \n"
 #endif
-"lw    $t0, 0($t2)                            \n" // $t0 = address of start of block code, or
-                                                  //       or 0 if block needs recompilation
-                                                  // IMPORTANT: leave block ptr in $t2, it gets
-                                                  // saved & re-used if recRecompile() is called.
 
+// Load block pointer while we do cycle accounting (hide latency)
+"lw    $t0, 0($t2)                            \n" // $t0 = address of start of block code
+
+// Update psxRegs.cycle (we still need to do this for correct emulation state)
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
 "addu  $t3, $t3, $v1                          \n" // $t3 = psxRegs.cycle + $v1
+"sw    $t3, %[psxRegs_cycle_off]($fp)         \n" // Store new psxRegs.cycle val
 
-// Must call psxBranchTest() when psxRegs.cycle >= psxRegs.io_cycle_counter
-"sltu  $t4, $t3, $t4                          \n"
-"beqz  $t4, call_psxBranchTest%=              \n"
-"sw    $t3, %[psxRegs_cycle_off]($fp)         \n" // <BD> IMPORTANT: store new psxRegs.cycle val,
-                                                  //  whether or not we are branching here
+// v378e: EVENT CHECK - just test if $t9 <= 0 (signed compare)
+// This replaces: lw $t4, io_cycle_counter; sltu $t4, $t3, $t4; beqz $t4, ...
+// Savings: 2 memory loads removed from critical path!
+"blez  $t9, call_psxBranchTest%=              \n" // if event_delta <= 0, handle events
+"sw    $v0, %[psxRegs_pc_off]($fp)            \n" // <BD> Store new psxRegs.pc val
 
 // Recompile block, if necessary
 "beqz  $t0, recompile_block%=                 \n"
-"sw    $v0, %[psxRegs_pc_off]($fp)            \n" // <BD> Use BD slot to store new psxRegs.pc val
+"nop                                          \n" // <BD>
 
 // Execute already-compiled block. It returns to top of 'fastpath' loop if it
 //  jumps to its own beginning PC. Otherwise, it returns to top of main loop.
@@ -1383,16 +1403,18 @@ __asm__ __volatile__ (
 ////////////////////////////
 
 // Call psxBranchTest() and go back to top of loop
+// v378e: After psxBranchTest returns, recalculate $t9 from updated io_cycle_counter
 "call_psxBranchTest%=:                        \n"
 "jal   %[psxBranchTest]                       \n"
-"sw    $v0, %[psxRegs_pc_off]($fp)            \n" // <BD> Store new psxRegs.pc val before calling C
-"branchtest_fastpath_retaddr%=:               \n" // Next 3 instructions shared with 'fastpath' code..
-"lw    $v0, %[psxRegs_pc_off]($fp)            \n" // After psxBranchTest() returns, load psxRegs.pc
-                                                  //  back into $v0, which could be different than
-                                                  //  before the call if an exception was issued.
+"nop                                          \n" // <BD> PC already saved above
+"branchtest_fastpath_retaddr%=:               \n" // Next instructions shared with 'fastpath' code..
+// v378e: Recalculate event delta after psxBranchTest (events may have been rescheduled)
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
+"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+"subu  $t9, $t4, $t3                          \n" // $t9 = new event delta
+"lw    $v0, %[psxRegs_pc_off]($fp)            \n" // Load psxRegs.pc (may have changed)
 "b     loop%=                                 \n" // Go back to top to process new psxRegs.pc value..
-"move  $v1, $0                                \n" // <BD> ..using BD slot to set $v1 to 0, since
-                                                  //  psxRegs.cycle shouldn't be incremented again.
+"move  $v1, $0                                \n" // <BD> Set $v1 to 0, cycle already updated
 
 #ifdef USE_DIRECT_FASTPATH_BLOCK_RETURN_JUMPS
 ////////////////////////////
@@ -1405,17 +1427,18 @@ __asm__ __volatile__ (
 //  unmodified, saving cycles versus the general loop. The main loop was
 //  careful to save the block start address at location in stack frame.
 //  NOTE: Blocks returning this way don't bother to set $v0 to any PC value.
+// v378e: Uses event delta register for fast event check
 "fastpath_loop%=:                             \n"
-"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
-"lw    $t4, %[psxRegs_io_cycle_ctr_off]($fp)  \n" // $t4 = psxRegs.io_cycle_counter
+// v378e: Subtract block cycles from event delta
+"subu  $t9, $t9, $v1                          \n" // $t9 -= $v1 (event delta decrement)
 "lw    $t0, f_off_block_start_addr($sp)       \n" // Load block code addr saved in main loop
+"lw    $t3, %[psxRegs_cycle_off]($fp)         \n" // $t3 = psxRegs.cycle
 "addu  $t3, $t3, $v1                          \n" // $t3 = psxRegs.cycle + $v1
+"sw    $t3, %[psxRegs_cycle_off]($fp)         \n" // Store new psxRegs.cycle val
 
-// Must call psxBranchTest() when psxRegs.cycle >= psxRegs.io_cycle_counter
-"sltu  $t4, $t3, $t4                          \n"
-"beqz  $t4, call_psxBranchTest_fastpath%=     \n"
-"sw    $t3, %[psxRegs_cycle_off]($fp)         \n" // <BD> IMPORTANT: store new psxRegs.cycle val,
-                                                  //  whether or not we are branching here
+// v378e: EVENT CHECK - test if $t9 <= 0
+"blez  $t9, call_psxBranchTest_fastpath%=     \n"
+"nop                                          \n" // <BD>
 
 // Execute already-compiled block. It returns to top of 'fastpath' loop if it
 //  jumps to its own beginning PC. Otherwise, it returns to top of main loop.
@@ -1439,10 +1462,13 @@ __asm__ __volatile__ (
 ////////////////////////////
 
 // Recompile block and return to normal codepath.
+// v378e: Save/restore $t9 (event delta) across recRecompile call
 "recompile_block%=:                           \n"
+"sw    $t9, %[psxRegs_cycles_until_event]($fp) \n" // Save event delta to psxRegs
 "jal   %[recRecompile]                        \n"
 "sw    $t2, f_off_temp_var1($sp)              \n" // <BD> Save block ptr across call
 "lw    $t2, f_off_temp_var1($sp)              \n" // Restore block ptr upon return
+"lw    $t9, %[psxRegs_cycles_until_event]($fp) \n" // Restore event delta
 "lw    $v0, %[psxRegs_pc_off]($fp)            \n" // Blocks expect $v0 to contain PC val on entry
 "b     execute_block%=                        \n" // Resume normal code path, but first we must..
 "lw    $t0, 0($t2)                            \n" // <BD> ..load $t0 with ptr to block code
@@ -1468,10 +1494,11 @@ __asm__ __volatile__ (
   [psxRegs_pc_off]             "i" (off(pc)),
   [psxRegs_cycle_off]          "i" (off(cycle)),
   [psxRegs_io_cycle_ctr_off]   "i" (off(io_cycle_counter)),
+  [psxRegs_cycles_until_event] "i" (off(cycles_until_event)),
   [recRecompile]               "i" (&recRecompile),
   [psxBranchTest]              "i" (&psxBranchTest),
   [REC_RAM_VADDR_UPPER]        "i" (REC_RAM_VADDR >> 16)
-: // Clobber - No need to list anything but 'saved' regs
+: // Clobber - No need to list anything but 'saved' regs, plus $t9 now reserved
   "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp", "ra", "memory"
 );
 }

@@ -107,7 +107,7 @@ static void update_debug_log_state(int enabled)
 
 /* v343: Only log when debug_log enabled (was always logging) */
 #ifdef SF2000
-#define XLOG(fmt, ...) do { if (g_debug_log_enabled) xlog("QPSX: " fmt "\n", ##__VA_ARGS__); } while(0)
+#define XLOG(fmt, ...) do { if (g_debug_log_enabled) printf("QPSX: " fmt "\n", ##__VA_ARGS__); } while(0)
 #else
 #define XLOG(fmt, ...) do { if (g_debug_log_enabled) printf("QPSX: " fmt "\n", ##__VA_ARGS__); } while(0)
 #endif
@@ -682,7 +682,7 @@ extern "C" void retro_audio_cb(int16_t *buf, int samples)
     audio_batch_cb(buf, samples);
 }
 
-#define QPSX_VERSION "398"
+#define QPSX_VERSION "400"
 #define QPSX_GLOBAL_CONFIG_PATH "/mnt/sda1/cores/config/pcsx4all.cfg"
 #define QPSX_NATIVE_CONFIG_PATH "/mnt/sda1/cores/config/psx_native.cfg"
 #define QPSX_ASM_CONFIG_PATH "/mnt/sda1/cores/config/psx_asm.cfg"
@@ -1334,7 +1334,7 @@ enum {
  * GPU options (except Pixel Size), SMC Check, Dynarec options = HARDCODED
  */
 static const MenuItem menu_items[MENU_ITEMS] = {
-    {"--- QPSX v396 ---",   1, 0},
+    {"--- QPSX v400 ---",   1, 0},
     {">> SWAP CD <<",       2, 0},
     {"Frameskip",           0, 0},
     {"Target Speed",        0, 1},
@@ -3516,9 +3516,9 @@ static void qpsx_load_config(void)
 
 void retro_set_environment(retro_environment_t cb)
 {
-    xlog("\n========================================\n");
-    xlog("STARTING QPSX - VERSION %s\n", QPSX_VERSION);
-    xlog("========================================\n");
+    printf("\n========================================\n");
+    printf("STARTING QPSX - VERSION %s\n", QPSX_VERSION);
+    printf("========================================\n");
     environ_cb = cb;
     struct retro_variable variables[] = { { NULL, NULL } };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, variables);

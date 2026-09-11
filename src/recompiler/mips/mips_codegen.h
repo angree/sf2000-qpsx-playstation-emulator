@@ -104,6 +104,17 @@ typedef enum {
 /* PERM_REG_1 is pointer to psxRegs struct */
 #define PERM_REG_1           MIPSREG_S8
 
+/* v378e: Event delta register - holds cycles until next event
+ * This is a POPS-style optimization: instead of comparing psxRegs.cycle
+ * against psxRegs.io_cycle_counter (2 memory loads), we keep the delta
+ * (io_cycle_counter - cycle) in $t9 and decrement it by block cycles.
+ * Event check becomes: if ($t9 <= 0) call psxBranchTest
+ *
+ * $t9 is caller-saved but we save/restore it around C calls in dispatch loop.
+ * WARNING: Do NOT use $t9 as a temporary in emitted block code!
+ */
+#define EVENT_DELTA_REG      MIPSREG_T9
+
 
 /* NOTE: it is assumed the platform has basic MIPS32r1 ISA, i.e. it has at
  *       minimum CLZ,MOVN,MOVZ,MUL.

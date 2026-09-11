@@ -4,7 +4,28 @@ PlayStation 1 (PSX) emulator for Data Frog SF2000 and GB300 handheld devices.
 
 Based on PCSX4ALL with MIPS-to-MIPS dynamic recompiler, ported to the SF2000/GB300 multicore framework.
 
-**Current Version: v374** - Significant performance improvements over previous releases.
+**Current Version: v400** - Much better compatibility with homebrew, including games made with [PSXFORGE.COM](https://psxforge.com).
+
+## Changelog v400
+
+### Much better compatibility with homebrew games
+- Bare-metal homebrew now runs correctly, in particular **games created with [PSXFORGE.COM](https://psxforge.com)**
+- Games that install their own exception handler at `0x80000080` no longer hang - the HLE BIOS
+  used to swallow the interrupt instead of passing it to the game. Most visible as a freeze the
+  first time a game re-reads CD audio while streaming music
+- Restored CPU register state on the HLE interrupt path that returns without `jmp_int`
+- Guarded against a null pointer while walking the BIOS interrupt handler queue
+
+### Also included (never released separately)
+- v397-v398: fixed hangs on exit, maximum cycle count raised to 4096
+- Emulator diagnostics no longer write to the SD card
+
+## Changelog v396
+
+### Per-game memory cards
+- Memory cards are now created per game, on demand
+- To keep old saves, let the emulator create the card for your game first, then replace it with
+  your copy from `bios/config` in `roms/save/psx`
 
 ## Changelog v395
 

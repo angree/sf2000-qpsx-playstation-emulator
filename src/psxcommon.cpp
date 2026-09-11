@@ -32,7 +32,7 @@ static int emu_update_count = 0;
 extern "C" {
     extern void xlog(const char *fmt, ...);
 }
-#define EMU_LOG(fmt, ...) xlog("EMU: " fmt "\n", ##__VA_ARGS__)
+#define EMU_LOG(fmt, ...) printf("EMU: " fmt "\n", ##__VA_ARGS__)
 #else
 #define EMU_LOG(fmt, ...) do {} while(0)
 #endif
